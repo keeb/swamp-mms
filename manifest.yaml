@@ -1,0 +1,21 @@
+manifestVersion: 1
+name: "@keeb/mms"
+version: "2026.03.29.1"
+description: "Media management system — content discovery, deduplication, download protocol handling, and LLM-powered file organization"
+repository: https://github.com/keeb/swamp-mms
+labels:
+  - media
+  - anime
+  - torrents
+  - usenet
+  - transmission
+  - sabnzbd
+  - ollama
+models:
+  - mms_source.ts
+  - mms_downloader.ts
+  - mms_dedup.ts
+  - mms_organizer.ts
+reports:
+  - discovery_summary.ts
+  - dedup_summary.ts

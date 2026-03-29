@@ -1,0 +1,624 @@
+import { z } from "npm:zod@4";
+import { XMLParser } from "npm:fast-xml-parser@4.5.1";
+
+// --- Schemas ---
+
+const ShowConfigSchema = z.object({
+  name: z.string().describe("Show name to search for"),
+  provider: z
+    .enum(["subsplease", "nyaa", "eztv", "newznab"])
+    .describe("Content source provider"),
+  resolution: z.string().default("1080").describe(
+    "Resolution filter (e.g. 1080)",
+  ),
+  nyaaUser: z
+    .string()
+    .optional()
+    .describe("Nyaa uploader filter (e.g. Erai-raws)"),
+  nyaaQuery: z
+    .string()
+    .optional()
+    .describe("Override Nyaa search query (defaults to show name)"),
+  eztvUrl: z
+    .string()
+    .optional()
+    .describe("Custom EZTV RSS URL (defaults to myrss.org/eztv)"),
+  newznabUrl: z
+    .string()
+    .optional()
+    .describe("Newznab API base URL (e.g. https://api.althub.co.za)"),
+  newznabApiKey: z
+    .string()
+    .optional()
+    .meta({ sensitive: true })
+    .describe("Newznab API key"),
+  newznabCat: z
+    .string()
+    .optional()
+    .describe("Newznab category ID (e.g. 5040 for TV HD)"),
+});
+
+const GlobalArgsSchema = z.object({
+  shows: z
+    .array(ShowConfigSchema)
+    .optional()
+    .describe("Configured shows for search_configured method"),
+});
+
+const EpisodeSchema = z.object({
+  show: z.string().describe(
+    "Show name (from search query for subsplease, raw for nyaa)",
+  ),
+  episode: z.string().optional().describe(
+    "Episode number (extracted for subsplease, absent for nyaa)",
+  ),
+  magnet: z.string().describe(
+    "Download URI (magnet for torrents, NZB URL for usenet)",
+  ),
+  provider: z.string().describe("Source provider"),
+  resolution: z.string().describe("Video resolution"),
+  infoHash: z.string().optional().describe("Torrent info hash"),
+  publishDate: z.string().optional().describe("RSS publish date"),
+  rawTitle: z.string().optional().describe("Original title from source"),
+  seeders: z.number().optional().describe("Seeder count (nyaa)"),
+  protocol: z.enum(["torrent", "usenet"]).optional().describe(
+    "Download protocol",
+  ),
+  size: z.number().optional().describe("File size in bytes"),
+});
+
+// --- SubsPlease ---
+
+interface SubsPleaseDownload {
+  res: string;
+  magnet: string;
+}
+
+interface SubsPleaseEntry {
+  downloads: SubsPleaseDownload[];
+}
+
+async function searchSubsPlease(
+  query: string,
+  resolution: string,
+  logger,
+): Promise<unknown[]> {
+  const encoded = encodeURIComponent(query);
+  const url =
+    `https://subsplease.org/api/?f=search&tz=America/New_York&s=${encoded}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`SubsPlease API error: ${resp.status}`);
+
+  const data = await resp.json();
+  if (Array.isArray(data)) return [];
+
+  const batchPattern = /\d{2}-\d{2}/;
+  const results = [];
+
+  for (
+    const [key, value] of Object.entries(
+      data as Record<string, SubsPleaseEntry>,
+    )
+  ) {
+    if (batchPattern.test(key)) continue;
+
+    let episode: string;
+    if (key.endsWith(" - Movie")) {
+      const parts = key.replace(/ - Movie$/, "").split(" - ");
+      episode = parts.length > 1 ? parts[1] : parts[0];
+    } else {
+      episode = key.split(" ").pop() ?? key;
+    }
+
+    const downloads = (value as SubsPleaseEntry).downloads ?? [];
+    for (const dl of downloads) {
+      if (dl.res === resolution) {
+        results.push({
+          show: query,
+          episode,
+          magnet: dl.magnet,
+          provider: "subsplease",
+          resolution,
+          rawTitle: key,
+        });
+      }
+    }
+  }
+
+  logger.info(`SubsPlease: found ${results.length} episodes for "${query}"`);
+  return results;
+}
+
+// --- Nyaa (general, no LLM) ---
+
+const BATCH_PATTERN = /\d+\s*~\s*\d+/;
+
+async function searchNyaa(
+  query: string,
+  resolution: string,
+  logger,
+  nyaaUser?: string,
+  nyaaQuery?: string,
+): Promise<unknown[]> {
+  const searchTerm = nyaaQuery ?? query;
+  const params = new URLSearchParams({
+    page: "rss",
+    q: searchTerm,
+    c: "1_0",
+    f: "0",
+  });
+  if (nyaaUser) params.set("u", nyaaUser);
+
+  const url = `https://nyaa.si/?${params}`;
+  logger.info(`Nyaa RSS: ${url}`);
+
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Nyaa RSS error: ${resp.status}`);
+
+  const xml = await resp.text();
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    removeNSPrefix: false,
+  });
+  const feed = parser.parse(xml);
+  const items = feed?.rss?.channel?.item ?? [];
+  const itemList = Array.isArray(items) ? items : [items];
+
+  const normalizedRes = resolution.replace(/p$/, "");
+  const results = [];
+
+  for (const item of itemList) {
+    const title = item.title;
+    const infoHash = item["nyaa:infoHash"];
+    if (!title || !infoHash) continue;
+
+    // Skip batches
+    if (BATCH_PATTERN.test(title)) continue;
+
+    // Quick resolution filter
+    if (!title.includes(`${normalizedRes}p`)) continue;
+
+    const encodedTitle = encodeURIComponent(title);
+    const magnet = `magnet:?xt=urn:btih:${infoHash}&dn=${encodedTitle}`;
+    const seeders = parseInt(item["nyaa:seeders"]) || 0;
+
+    results.push({
+      show: query,
+      magnet,
+      provider: "nyaa",
+      resolution: `${normalizedRes}p`,
+      infoHash,
+      rawTitle: title,
+      publishDate: item.pubDate,
+      seeders,
+    });
+  }
+
+  // Deduplicate by infoHash
+  const seen = new Set<string>();
+  const deduped = results.filter((r) => {
+    if (seen.has(r.infoHash)) return false;
+    seen.add(r.infoHash);
+    return true;
+  });
+
+  logger.info(
+    `Nyaa: ${deduped.length} items after filter+dedup (from ${itemList.length} raw)`,
+  );
+  return deduped;
+}
+
+// --- EZTV ---
+
+const EZTV_DEFAULT_URL = "https://myrss.org/eztv";
+
+async function searchEztv(
+  query: string,
+  resolution: string,
+  logger,
+  eztvUrl?: string,
+): Promise<unknown[]> {
+  const url = eztvUrl ?? EZTV_DEFAULT_URL;
+  logger.info(`EZTV RSS: ${url}`);
+
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`EZTV RSS error: ${resp.status}`);
+
+  const xml = await resp.text();
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    removeNSPrefix: false,
+    isArray: (_name: string, jpath: string) => jpath === "rss.channel.item",
+  });
+  const feed = parser.parse(xml);
+  const items = feed?.rss?.channel?.item ?? [];
+
+  const normalizedRes = resolution.replace(/p$/, "");
+  const normalizedQuery = query.toLowerCase();
+  const results = [];
+
+  for (const item of items) {
+    const title = item.title ?? item["torrent:fileName"];
+    if (!title) continue;
+
+    // Filter by show name (case-insensitive substring match)
+    if (!title.toLowerCase().includes(normalizedQuery)) continue;
+
+    // Resolution filter
+    if (
+      !title.includes(`${normalizedRes}p`) && !title.includes(normalizedRes)
+    ) continue;
+
+    // Extract magnet — may be in torrent:magnetURI (possibly CDATA-wrapped)
+    let magnet = item["torrent:magnetURI"] ?? "";
+    if (typeof magnet === "object") magnet = magnet["#text"] ?? "";
+    magnet = magnet.trim();
+
+    const infoHash = item["torrent:infoHash"] ?? "";
+    if (!magnet && infoHash) {
+      magnet = `magnet:?xt=urn:btih:${infoHash}&dn=${
+        encodeURIComponent(title)
+      }`;
+    }
+    if (!magnet) continue;
+
+    const seeders = parseInt(item["torrent:seeds"]) || 0;
+
+    results.push({
+      show: query,
+      magnet,
+      provider: "eztv",
+      resolution: `${normalizedRes}p`,
+      infoHash: infoHash || undefined,
+      rawTitle: title,
+      publishDate: item.pubDate,
+      seeders,
+    });
+  }
+
+  // Deduplicate by infoHash
+  const seen = new Set<string>();
+  const deduped = results.filter((r) => {
+    if (!r.infoHash) return true;
+    if (seen.has(r.infoHash)) return false;
+    seen.add(r.infoHash);
+    return true;
+  });
+
+  logger.info(
+    `EZTV: ${deduped.length} items matching "${query}" at ${normalizedRes}p (from ${items.length} raw)`,
+  );
+  return deduped;
+}
+
+// --- Newznab (usenet indexers like althub, nzbgeek, etc.) ---
+
+async function searchNewznab(
+  query: string,
+  resolution: string,
+  apiUrl: string,
+  apiKey: string,
+  logger,
+  category?: string,
+): Promise<unknown[]> {
+  const params = new URLSearchParams({
+    t: "tvsearch",
+    q: query,
+    apikey: apiKey,
+    cat: category ?? "5040", // TV HD
+    limit: "100",
+  });
+
+  const url = `${apiUrl}/api?${params}`;
+  logger.info(
+    `Newznab: ${apiUrl}/api?t=tvsearch&q=${encodeURIComponent(query)}&cat=${
+      category ?? "5040"
+    }`,
+  );
+
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Newznab API error: ${resp.status}`);
+
+  const xml = await resp.text();
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    removeNSPrefix: false,
+    isArray: (_name: string, jpath: string) =>
+      jpath === "rss.channel.item" || jpath.endsWith(".newznab:attr"),
+  });
+  const feed = parser.parse(xml);
+  const items = feed?.rss?.channel?.item ?? [];
+
+  const normalizedRes = resolution.replace(/p$/, "");
+  const results = [];
+
+  for (const item of items) {
+    const title = item.title;
+    if (!title) continue;
+
+    // Resolution filter
+    if (
+      !title.includes(`${normalizedRes}p`) && !title.includes(normalizedRes)
+    ) continue;
+
+    // Prefer MeGusta HEVC releases
+    const isMegusta = title.includes("MeGusta");
+    const isHevc = title.includes("HEVC") || title.includes("x265");
+
+    // NZB download URL
+    let nzbUrl = item.link ?? "";
+    if (typeof nzbUrl === "object") nzbUrl = nzbUrl["#text"] ?? "";
+
+    // Extract guid for dedup
+    let guid = "";
+    if (typeof item.guid === "string") {
+      guid = item.guid;
+    } else if (item.guid?.["#text"]) {
+      guid = item.guid["#text"];
+    }
+    // Extract guid hash from URL
+    const guidMatch = guid.match(/([a-f0-9]{32})/);
+    const guidHash = guidMatch ? guidMatch[1] : "";
+
+    // Extract size from newznab attributes
+    let size = 0;
+    const enclosure = item.enclosure;
+    if (enclosure?.["@_length"]) {
+      size = parseInt(enclosure["@_length"]) || 0;
+    }
+
+    if (!nzbUrl) continue;
+
+    results.push({
+      show: query,
+      magnet: nzbUrl, // NZB URL goes in the magnet field
+      provider: "newznab",
+      resolution: `${normalizedRes}p`,
+      rawTitle: title,
+      publishDate: item.pubDate,
+      protocol: "usenet",
+      size,
+      infoHash: guidHash || undefined,
+      _isMegusta: isMegusta,
+      _isHevc: isHevc,
+      _score: (isMegusta ? 10 : 0) + (isHevc ? 5 : 0),
+    });
+  }
+
+  // Sort by preference: MeGusta HEVC first, then HEVC, then rest
+  results.sort((a, b) => b._score - a._score);
+
+  // Deduplicate by title (keep highest scored)
+  const seen = new Set<string>();
+  const deduped = results.filter((r) => {
+    const key = r.rawTitle;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map(({ _isMegusta, _isHevc, _score, ...rest }) => rest);
+
+  logger.info(
+    `Newznab: ${deduped.length} items for "${query}" at ${normalizedRes}p (from ${items.length} raw)`,
+  );
+  return deduped;
+}
+
+// --- Model ---
+
+export const model = {
+  type: "@keeb/mms/source",
+  version: "2026.03.29.3",
+  reports: ["@keeb/mms/discovery-summary"],
+  globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      fromVersion: "2026.03.28.1",
+      toVersion: "2026.03.28.2",
+      description:
+        "Replace erai-raws provider with general nyaa provider, add ollama config",
+      upgradeAttributes: (old) => ({
+        ...old,
+        shows: old.shows?.map((s) => ({
+          ...s,
+          provider: s.provider === "erai-raws" ? "nyaa" : s.provider,
+          nyaaUser: s.provider === "erai-raws" ? "Erai-raws" : s.nyaaUser,
+        })),
+      }),
+    },
+    {
+      fromVersion: "2026.03.28.2",
+      toVersion: "2026.03.29.1",
+      description:
+        "Remove inline ollama — LLM parsing happens via @keeb/ollama model in workflow",
+      upgradeAttributes: (old) => {
+        const { ollamaUrl: _ollamaUrl, ollamaModel: _ollamaModel, ...rest } =
+          old;
+        return rest;
+      },
+    },
+    {
+      fromVersion: "2026.03.29.1",
+      toVersion: "2026.03.29.2",
+      description: "Add EZTV provider for western TV shows",
+      upgradeAttributes: (old) => old,
+    },
+    {
+      fromVersion: "2026.03.29.2",
+      toVersion: "2026.03.29.3",
+      description:
+        "Add Newznab provider for usenet indexers (althub, nzbgeek, etc.)",
+      upgradeAttributes: (old) => old,
+    },
+  ],
+  resources: {
+    episode: {
+      description:
+        "Discovered content from source (raw for nyaa, structured for subsplease)",
+      schema: EpisodeSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+  },
+  methods: {
+    search: {
+      description:
+        "Search a provider for content (factory: one resource per item)",
+      arguments: z.object({
+        query: z.string().describe("Show name to search for"),
+        provider: z.enum(["subsplease", "nyaa", "eztv", "newznab"]).describe(
+          "Source provider",
+        ),
+        resolution: z.string().default("1080").describe("Resolution filter"),
+        nyaaUser: z.string().optional().describe("Nyaa uploader filter"),
+        nyaaQuery: z.string().optional().describe("Override search query"),
+        eztvUrl: z.string().optional().describe("Custom EZTV RSS URL"),
+        newznabUrl: z.string().optional().describe("Newznab API base URL"),
+        newznabApiKey: z.string().optional().meta({ sensitive: true }).describe(
+          "Newznab API key",
+        ),
+        newznabCat: z.string().optional().describe("Newznab category ID"),
+      }),
+      execute: async (
+        args: {
+          query: string;
+          provider: "subsplease" | "nyaa" | "eztv" | "newznab";
+          resolution: string;
+          nyaaUser?: string;
+          nyaaQuery?: string;
+          eztvUrl?: string;
+          newznabUrl?: string;
+          newznabApiKey?: string;
+          newznabCat?: string;
+        },
+        context,
+      ) => {
+        const items = args.provider === "subsplease"
+          ? await searchSubsPlease(args.query, args.resolution, context.logger)
+          : args.provider === "eztv"
+          ? await searchEztv(
+            args.query,
+            args.resolution,
+            context.logger,
+            args.eztvUrl,
+          )
+          : args.provider === "newznab"
+          ? await searchNewznab(
+            args.query,
+            args.resolution,
+            args.newznabUrl!,
+            args.newznabApiKey!,
+            context.logger,
+            args.newznabCat,
+          )
+          : await searchNyaa(
+            args.query,
+            args.resolution,
+            context.logger,
+            args.nyaaUser,
+            args.nyaaQuery,
+          );
+
+        const handles = [];
+        for (const item of items) {
+          const instanceName = slugify(
+            item.infoHash
+              ? `${item.provider}-${item.infoHash.slice(0, 16)}`
+              : `${item.provider}-${
+                item.rawTitle ?? item.show + "-" + (item.episode ?? "unknown")
+              }`,
+          );
+          const handle = await context.writeResource(
+            "episode",
+            instanceName,
+            item,
+          );
+          handles.push(handle);
+        }
+        return { dataHandles: handles };
+      },
+    },
+
+    search_configured: {
+      description:
+        "Search all configured shows (factory: one resource per item across all shows)",
+      arguments: z.object({}),
+      execute: async (_args: Record<string, never>, context) => {
+        const shows = context.globalArgs.shows ?? [];
+        if (shows.length === 0) {
+          context.logger.info("No shows configured");
+          return { dataHandles: [] };
+        }
+
+        const handles = [];
+
+        for (const show of shows) {
+          try {
+            const items = show.provider === "subsplease"
+              ? await searchSubsPlease(
+                show.name,
+                show.resolution ?? "1080",
+                context.logger,
+              )
+              : show.provider === "eztv"
+              ? await searchEztv(
+                show.name,
+                show.resolution ?? "1080",
+                context.logger,
+                show.eztvUrl,
+              )
+              : show.provider === "newznab"
+              ? await searchNewznab(
+                show.name,
+                show.resolution ?? "1080",
+                show.newznabUrl!,
+                show.newznabApiKey!,
+                context.logger,
+                show.newznabCat,
+              )
+              : await searchNyaa(
+                show.name,
+                show.resolution ?? "1080",
+                context.logger,
+                show.nyaaUser,
+                show.nyaaQuery,
+              );
+
+            for (const item of items) {
+              const instanceName = slugify(
+                item.infoHash
+                  ? `${item.provider}-${item.infoHash.slice(0, 16)}`
+                  : `${item.provider}-${
+                    item.rawTitle ??
+                      item.show + "-" + (item.episode ?? "unknown")
+                  }`,
+              );
+              const handle = await context.writeResource(
+                "episode",
+                instanceName,
+                item,
+              );
+              handles.push(handle);
+            }
+          } catch (err) {
+            context.logger.error(
+              `Failed "${show.name}" on ${show.provider}: ${err}`,
+            );
+          }
+        }
+
+        context.logger.info(
+          `Total: ${handles.length} items across ${shows.length} shows`,
+        );
+        return { dataHandles: handles };
+      },
+    },
+  },
+};
+
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
