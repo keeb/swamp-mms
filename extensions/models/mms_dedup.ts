@@ -1,59 +1,7 @@
 import { z } from "npm:zod@4";
+import { ollamaGenerate } from "./_lib/ollama.ts";
 
-// --- Embedded filename-to-json prompt ---
-
-const FILENAME_TO_JSON_PROMPT = `# Media Filename Parser
-
-Parse TV show, anime, and movie filenames into structured data.
-
-## Input Format
-Filename (with or without extension)
-
-## Output Format
-Return JSON with these fields:
-- \`media_type\`: "tv_show", "anime", "movie", or "book"
-- \`title\`: Clean title (spaces, proper capitalization). This is the SHOW NAME ONLY — never include episode titles, quality info, or release group.
-- \`season\`: Season number (integer, null for movies/books)
-- \`episode\`: Episode number (integer, null for movies/books)
-- \`episode_title\`: Episode title if present (null if not found)
-- \`year\`: Release year if present (integer, null if not found)
-- \`confidence\`: High/Medium/Low based on pattern match quality
-
-## Detection Rules
-**Movie**: Single file, often has year, no season/episode markers
-**Anime**: Japanese titles, episode ranges like "01-12", "OVA", "Special"
-**TV Show**: Standard S##E## or #x## patterns, Western show names
-**Book**: Comic book archives (.cbz, .cbr), manga, graphic novels, often numbered volumes
-
-## Common Patterns
-- TV: \`Show.Name.S01E01.Episode.Title.ext\` → title is "Show Name", episode_title is "Episode Title"
-- Anime: \`Anime Title - 01 [1080p].mkv\` or \`Anime.Title.E01.ext\`
-- Movie: \`Movie Title (2023) 1080p.mp4\`
-
-## Special Cases (Anime Season Detection)
-These rules OVERRIDE the default season detection:
-- "Jujutsu Kaisen - Shimetsu Kaiyuu" or "Jujutsu Kaisen: Shimetsu Kaiyuu" → season: 3
-- "Jujutsu Kaisen 2nd Season" → season: 2
-- Any anime with "2nd Season" in the title → season: 2
-- Any anime with "3rd Season" in the title → season: 3
-
-## Examples
-Input: \`The.Sopranos.S01E01.Pilot.avi\`
-Output: \`{"media_type": "tv_show", "title": "The Sopranos", "season": 1, "episode": 1, "episode_title": "Pilot", "year": null, "confidence": "High"}\`
-
-Input: \`Star.Trek.Starfleet.Academy.S01E09.300th.Night.1080p.AMZN.WEB-DL.DDP.5.1.H.264-NTb\`
-Output: \`{"media_type": "tv_show", "title": "Star Trek Starfleet Academy", "season": 1, "episode": 9, "episode_title": "300th Night", "year": null, "confidence": "High"}\`
-
-Input: \`Scrubs.2026.S01E06.My.V.I.P.1080p.HEVC.x265-MeGusta\`
-Output: \`{"media_type": "tv_show", "title": "Scrubs 2026", "season": 1, "episode": 6, "episode_title": "My V I P", "year": null, "confidence": "High"}\`
-
-Input: \`[SubsPlease] Dandadan - 01 (1080p) [2AB10B14].mkv\`
-Output: \`{"media_type": "anime", "title": "Dandadan", "season": null, "episode": 1, "episode_title": null, "year": null, "confidence": "High"}\`
-
-Input: \`[Erai-raws] Jujutsu Kaisen: Shimetsu Kaiyuu - Zenpen - 05 [1080p]\`
-Output: \`{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 3, "episode": 5, "episode_title": null, "year": null, "confidence": "High"}\`
-
-Parse the filename and return only the JSON response.`;
+// Prompt loaded at runtime from prompts/filename-to-json.prompt via context.repoDir
 
 // --- Schemas ---
 
@@ -87,34 +35,51 @@ const EpisodeSchema = z.object({
   size: z.number().optional().describe("File size in bytes"),
 });
 
-// --- Ollama ---
+// --- Regex title parser (fast path, avoids LLM) ---
 
-async function ollamaGenerate(
-  ollamaUrl: string,
-  model: string,
-  prompt: string,
-  input: string,
-): Promise<string> {
-  const resp = await fetch(`${ollamaUrl}/api/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      prompt: `${prompt}\n\n${input}`,
-      stream: false,
-      think: false,
-      options: { num_predict: 512 },
-    }),
-  });
-  if (!resp.ok) {
-    throw new Error(`Ollama error (${resp.status}): ${await resp.text()}`);
+function regexParseTitle(
+  raw: string,
+): { show: string; episode: string; season?: string } | null {
+  // S01E06 / S1E6 / s01e06
+  const seMatch = raw.match(/^(.+?)[.\s_-]+[Ss](\d{1,2})[Ee](\d{1,3})\b/);
+  if (seMatch) {
+    return {
+      show: seMatch[1].replace(/\./g, " ").trim(),
+      season: String(parseInt(seMatch[2])),
+      episode: String(parseInt(seMatch[3])),
+    };
   }
-  const json = await resp.json();
-  let raw = (json.response ?? "").trim();
-  if (raw.startsWith("```")) {
-    raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+
+  // 1x06 / 01x06
+  const xMatch = raw.match(/^(.+?)[.\s_-]+(\d{1,2})x(\d{1,3})\b/);
+  if (xMatch) {
+    return {
+      show: xMatch[1].replace(/\./g, " ").trim(),
+      season: String(parseInt(xMatch[2])),
+      episode: String(parseInt(xMatch[3])),
+    };
   }
-  return raw;
+
+  // Anime style: [Group] Title - 06 [1080p] or Title - 1106
+  // Handles: space-dash-space, space-dash-number, various digit lengths
+  const animeMatch = raw.match(/^(?:\[.*?\]\s*)?(.+?)\s+-\s*(\d{2,4})\b/);
+  if (animeMatch) {
+    return {
+      show: animeMatch[1].trim(),
+      episode: String(parseInt(animeMatch[2])),
+    };
+  }
+
+  // Bare: Title 1106 [quality] or Title.1106.stuff (no dash, common in Nyaa)
+  const bareMatch = raw.match(/^(?:\[.*?\]\s*)?(.+?)\s+(\d{3,4})\s*[\[\(\.]/);
+  if (bareMatch) {
+    return {
+      show: bareMatch[1].trim(),
+      episode: String(parseInt(bareMatch[2])),
+    };
+  }
+
+  return null;
 }
 
 // --- Filesystem helpers ---
@@ -132,7 +97,8 @@ async function fileExistsForEpisode(
   episode: string,
   season: string | undefined,
   dirs: string[],
-  logger,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
 ): Promise<boolean> {
   const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
   const normalizedShow = normalize(show);
@@ -202,69 +168,6 @@ async function fileExistsForEpisode(
   return false;
 }
 
-// --- Data reading helpers ---
-
-async function readLatestData(
-  dataDir: string,
-): Promise<{ name: string; data }[]> {
-  const results: { name: string; data }[] = [];
-  try {
-    for await (const entry of Deno.readDir(dataDir)) {
-      if (!entry.isDirectory) continue;
-      if (entry.name.startsWith("report-")) continue;
-
-      const latestPath = `${dataDir}/${entry.name}/latest`;
-      let version: string;
-      try {
-        version = (await Deno.readTextFile(latestPath)).trim();
-      } catch {
-        continue;
-      }
-
-      const rawPath = `${dataDir}/${entry.name}/${version}/raw`;
-      try {
-        const content = await Deno.readTextFile(rawPath);
-        results.push({ name: entry.name, data: JSON.parse(content) });
-      } catch {
-        continue;
-      }
-    }
-  } catch { /* dataDir doesn't exist */ }
-  return results;
-}
-
-async function resolveModelByName(
-  repoDir: string,
-  name: string,
-): Promise<{ type: string; id: string } | null> {
-  for await (const entry of walkYaml(`${repoDir}/models`)) {
-    const content = await Deno.readTextFile(entry);
-    const nameMatch = content.match(/^name:\s*(.+)$/m);
-    const idMatch = content.match(/^id:\s*(.+)$/m);
-    const typeMatch = content.match(/^type:\s*'?(.+?)'?$/m);
-    if (nameMatch && idMatch && typeMatch) {
-      const defName = nameMatch[1].trim().replace(/^['"]|['"]$/g, "");
-      if (defName === name) {
-        return {
-          type: typeMatch[1].trim().replace(/^['"]|['"]$/g, ""),
-          id: idMatch[1].trim().replace(/^['"]|['"]$/g, ""),
-        };
-      }
-    }
-  }
-  return null;
-}
-
-async function* walkYaml(dir: string): AsyncGenerator<string> {
-  try {
-    for await (const entry of Deno.readDir(dir)) {
-      const path = `${dir}/${entry.name}`;
-      if (entry.isDirectory) yield* walkYaml(path);
-      else if (entry.name.endsWith(".yaml")) yield path;
-    }
-  } catch { /* directory doesn't exist */ }
-}
-
 // --- Model ---
 
 export const model = {
@@ -278,7 +181,8 @@ export const model = {
       toVersion: "2026.03.29.1",
       description:
         "Add Ollama integration for parsing raw titles, add ollamaUrl/ollamaModel globalArgs",
-      upgradeAttributes: (old) => ({
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => ({
         ...old,
         ollamaUrl: old.ollamaUrl ?? "http://localhost:11434",
         ollamaModel: old.ollamaModel ?? "qwen3:14b",
@@ -302,77 +206,88 @@ export const model = {
           .string()
           .describe("Name of the model whose episode data to filter"),
       }),
-      execute: async (args: { sourceModel: string }, context) => {
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: { sourceModel: string }, context: any) => {
         const { checkDirs, ollamaUrl, ollamaModel } = context.globalArgs;
 
-        // Resolve source model
-        const resolved = await resolveModelByName(
-          context.repoDir,
-          args.sourceModel,
-        );
-        if (!resolved) {
-          throw new Error(
-            `Could not find model definition for "${args.sourceModel}"`,
-          );
-        }
-        context.logger.info(
-          `Resolved "${args.sourceModel}" → type=${resolved.type}, id=${resolved.id}`,
+        // Load prompt from canonical file
+        const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
+          `${context.repoDir}/prompts/filename-to-json.prompt`,
         );
 
-        const dataDir =
-          `${context.repoDir}/.swamp/data/${resolved.type}/${resolved.id}`;
-        const items = await readLatestData(dataDir);
+        // Read source model data using first-class API
+        const items = await context.readModelData(args.sourceModel, "episode");
         if (items.length === 0) {
           context.logger.info(`No data found for "${args.sourceModel}"`);
           return { dataHandles: [] };
         }
 
-        const handles = [];
+        context.logger.info(
+          `Read ${items.length} episodes from "${args.sourceModel}"`,
+        );
+
+        // deno-lint-ignore no-explicit-any
+        const handles: any[] = [];
         let checked = 0;
         let skipped = 0;
         let llmParsed = 0;
+        let regexParsedCount = 0;
 
-        for (const { name: _name, data } of items) {
+        for (const item of items) {
+          const data = item.attributes;
           if (!data.magnet) continue;
 
           let show = data.show;
           let episode = data.episode;
           let season = data.season;
-          const needsLlm = !episode;
 
-          // If no episode field, try LLM parsing on the raw title
-          if (needsLlm && data.rawTitle) {
-            try {
-              const jsonStr = await ollamaGenerate(
-                ollamaUrl,
-                ollamaModel,
-                FILENAME_TO_JSON_PROMPT,
-                data.rawTitle,
+          // If no episode field, try regex first, then LLM as fallback
+          if (!episode && data.rawTitle) {
+            const regexParsed = regexParseTitle(data.rawTitle);
+            if (regexParsed) {
+              show = regexParsed.show;
+              episode = regexParsed.episode;
+              season = regexParsed.season;
+              regexParsedCount++;
+              context.logger.info(
+                `Regex: "${data.rawTitle.slice(0, 60)}" → ${show} s${
+                  season ?? "?"
+                } ep ${episode}`,
               );
-              const parsed = JSON.parse(jsonStr);
-              if (parsed.title && parsed.episode != null) {
-                show = parsed.title;
-                episode = String(parsed.episode);
-                season = parsed.season != null
-                  ? String(parsed.season)
-                  : undefined;
-                llmParsed++;
-                context.logger.info(
-                  `LLM: "${data.rawTitle.slice(0, 60)}" → ${show} s${
-                    season ?? "?"
-                  } ep ${episode}`,
+            } else {
+              // Fall back to LLM for titles regex can't handle
+              try {
+                const jsonStr = await ollamaGenerate(
+                  ollamaUrl,
+                  ollamaModel,
+                  FILENAME_TO_JSON_PROMPT,
+                  data.rawTitle,
                 );
-              } else {
+                const parsed = JSON.parse(jsonStr);
+                if (parsed.title && parsed.episode != null) {
+                  show = parsed.title;
+                  episode = String(parsed.episode);
+                  season = parsed.season != null
+                    ? String(parsed.season)
+                    : undefined;
+                  llmParsed++;
+                  context.logger.info(
+                    `LLM: "${data.rawTitle.slice(0, 60)}" → ${show} s${
+                      season ?? "?"
+                    } ep ${episode}`,
+                  );
+                } else {
+                  context.logger.info(
+                    `LLM: incomplete parse for "${data.rawTitle.slice(0, 60)}"`,
+                  );
+                  continue;
+                }
+              } catch (err) {
                 context.logger.info(
-                  `LLM: incomplete parse for "${data.rawTitle.slice(0, 60)}"`,
+                  `LLM: failed for "${data.rawTitle?.slice(0, 60)}": ${err}`,
                 );
                 continue;
               }
-            } catch (err) {
-              context.logger.info(
-                `LLM: failed for "${data.rawTitle?.slice(0, 60)}": ${err}`,
-              );
-              continue;
             }
           }
 
@@ -416,9 +331,10 @@ export const model = {
         }
 
         // Deduplicate new episodes — keep one per show+season+episode (prefer HEVC/MeGusta)
-        const byEpisode = new Map<string, unknown>();
+        // deno-lint-ignore no-explicit-any
+        const byEpisode = new Map<string, any>();
         for (const h of handles) {
-          const key = `${h._show}-s${h._season ?? "0"}-e${h._episode}`;
+          const key = slugDir(`${h._show}-s${h._season ?? "0"}-e${h._episode}`);
           const existing = byEpisode.get(key);
           if (!existing) {
             byEpisode.set(key, h);
@@ -437,7 +353,8 @@ export const model = {
         }
 
         // Write only the deduplicated winners
-        const finalHandles = [];
+        // deno-lint-ignore no-explicit-any
+        const finalHandles: any[] = [];
         for (const h of byEpisode.values()) {
           const instanceName = slugDir(
             `${h._provider}-${h._show}-s${h._season ?? "0"}-e${h._episode}`,
@@ -451,7 +368,7 @@ export const model = {
         }
 
         context.logger.info(
-          `Checked ${checked}: ${finalHandles.length} new (${handles.length} before dedup), ${skipped} on disk, ${llmParsed} LLM-parsed`,
+          `Checked ${checked}: ${finalHandles.length} new (${handles.length} before dedup), ${skipped} on disk, ${regexParsedCount} regex-parsed, ${llmParsed} LLM-parsed`,
         );
         return { dataHandles: finalHandles };
       },

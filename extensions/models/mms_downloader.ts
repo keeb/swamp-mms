@@ -36,7 +36,7 @@ async function transmissionRpc(
     );
   }
 
-  const _json = await resp.json();
+  const json = await resp.json();
   return {
     result: json as Record<string, unknown>,
     sessionId: sessionId ?? resp.headers.get("X-Transmission-Session-Id") ?? "",
@@ -48,6 +48,7 @@ async function transmissionRpc(
 const GlobalArgsSchema = z.object({
   transmissionUrl: z
     .string()
+    .optional()
     .describe("Base URL for Transmission RPC (e.g. http://host:9091)"),
   transmissionUser: z.string().optional().describe("Transmission RPC username"),
   transmissionPassword: z
@@ -87,6 +88,7 @@ const DownloadSchema = z.object({
 export const model = {
   type: "@keeb/mms/downloader",
   version: "2026.03.28.1",
+  reports: ["@keeb/mms/download-status"],
   globalArguments: GlobalArgsSchema,
   resources: {
     download: {
@@ -116,7 +118,8 @@ export const model = {
           protocol: "torrent" | "usenet";
           downloadDir?: string;
         },
-        context,
+        // deno-lint-ignore no-explicit-any
+        context: any,
       ) => {
         const now = new Date().toISOString();
 
@@ -136,17 +139,17 @@ export const model = {
             ? { user: transmissionUser, password: transmissionPassword }
             : undefined;
 
-          const { result: _result } = await transmissionRpc(
+          const { result } = await transmissionRpc(
             transmissionUrl,
             "torrent-add",
             rpcArgs,
             auth,
           );
 
-          const added =
-            (result as Record<string, unknown>).arguments?.["torrent-added"] ??
-              (result as Record<string, unknown>).arguments
-                ?.["torrent-duplicate"];
+          // deno-lint-ignore no-explicit-any
+          const added = (result as any).arguments?.["torrent-added"] ??
+            // deno-lint-ignore no-explicit-any
+            (result as any).arguments?.["torrent-duplicate"];
           const torrentName = added?.name ?? args.uri.slice(0, 80);
           const torrentId = String(added?.id ?? added?.hashString ?? "unknown");
 
@@ -183,7 +186,8 @@ export const model = {
               `SABnzbd addurl failed (${resp.status}): ${await resp.text()}`,
             );
           }
-          const _json = await resp.json();
+          // deno-lint-ignore no-explicit-any
+          const json: any = await resp.json();
           const nzoId = json.nzo_ids?.[0] ?? "unknown";
 
           const instanceName = `usenet-${nzoId}`;
@@ -207,8 +211,10 @@ export const model = {
       description:
         "Query all backends for current download status (factory: one resource per download)",
       arguments: z.object({}),
-      execute: async (_args: Record<string, never>, context) => {
-        const handles = [];
+      // deno-lint-ignore no-explicit-any
+      execute: async (_args: Record<string, never>, context: any) => {
+        // deno-lint-ignore no-explicit-any
+        const handles: any[] = [];
         const now = new Date().toISOString();
         const {
           transmissionUrl,
@@ -224,7 +230,7 @@ export const model = {
             ? { user: transmissionUser, password: transmissionPassword }
             : undefined;
 
-          const { result: _result } = await transmissionRpc(
+          const { result } = await transmissionRpc(
             transmissionUrl,
             "torrent-get",
             {
@@ -241,8 +247,8 @@ export const model = {
             auth,
           );
 
-          const torrents =
-            (result as Record<string, unknown>).arguments?.torrents ?? [];
+          // deno-lint-ignore no-explicit-any
+          const torrents: any[] = (result as any).arguments?.torrents ?? [];
 
           for (const t of torrents) {
             const statusMap: Record<number, string> = {
@@ -287,8 +293,10 @@ export const model = {
 
           const resp = await fetch(url.toString());
           if (resp.ok) {
-            const _json = await resp.json();
-            const slots = json.queue?.slots ?? [];
+            // deno-lint-ignore no-explicit-any
+            const json: any = await resp.json();
+            // deno-lint-ignore no-explicit-any
+            const slots: any[] = json.queue?.slots ?? [];
 
             for (const s of slots) {
               const instanceName = `usenet-${
@@ -331,7 +339,8 @@ export const model = {
       }),
       execute: async (
         args: { completedOnly: boolean; deleteData: boolean },
-        context,
+        // deno-lint-ignore no-explicit-any
+        context: any,
       ) => {
         const {
           transmissionUrl,
@@ -349,15 +358,15 @@ export const model = {
             ? { user: transmissionUser, password: transmissionPassword }
             : undefined;
 
-          const { result: _result, sessionId } = await transmissionRpc(
+          const { result, sessionId } = await transmissionRpc(
             transmissionUrl,
             "torrent-get",
             { fields: ["id", "name", "status", "percentDone"] },
             auth,
           );
 
-          const torrents =
-            (result as Record<string, unknown>).arguments?.torrents ?? [];
+          // deno-lint-ignore no-explicit-any
+          const torrents: any[] = (result as any).arguments?.torrents ?? [];
 
           const idsToRemove: number[] = [];
           for (const t of torrents) {

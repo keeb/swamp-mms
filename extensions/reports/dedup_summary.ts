@@ -3,7 +3,8 @@ export const report = {
   description: "Summarize dedup filter results: what's new vs what was skipped",
   scope: "method" as const,
   labels: ["discovery", "dedup"],
-  execute: async (context) => {
+  // deno-lint-ignore no-explicit-any
+  execute: async (context: any) => {
     const handles = context.dataHandles ?? [];
     const modelName = context.definition.name;
     const method = context.methodName;

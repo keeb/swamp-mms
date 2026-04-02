@@ -3,7 +3,8 @@ export const report = {
   description: "Summarize discovered content from source searches",
   scope: "method" as const,
   labels: ["discovery"],
-  execute: async (context) => {
+  // deno-lint-ignore no-explicit-any
+  execute: async (context: any) => {
     const handles = context.dataHandles ?? [];
     const modelName = context.definition.name;
     const method = context.methodName;

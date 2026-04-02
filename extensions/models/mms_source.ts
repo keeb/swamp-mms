@@ -11,6 +11,14 @@ const ShowConfigSchema = z.object({
   resolution: z.string().default("1080").describe(
     "Resolution filter (e.g. 1080)",
   ),
+  preferGroup: z
+    .string()
+    .optional()
+    .describe("Preferred release group (e.g. MeGusta)"),
+  preferCodec: z
+    .string()
+    .optional()
+    .describe("Preferred codec (e.g. HEVC, x265)"),
   nyaaUser: z
     .string()
     .optional()
@@ -81,8 +89,10 @@ interface SubsPleaseEntry {
 async function searchSubsPlease(
   query: string,
   resolution: string,
-  logger,
-): Promise<unknown[]> {
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+  // deno-lint-ignore no-explicit-any
+): Promise<any[]> {
   const encoded = encodeURIComponent(query);
   const url =
     `https://subsplease.org/api/?f=search&tz=America/New_York&s=${encoded}`;
@@ -93,7 +103,8 @@ async function searchSubsPlease(
   if (Array.isArray(data)) return [];
 
   const batchPattern = /\d{2}-\d{2}/;
-  const results = [];
+  // deno-lint-ignore no-explicit-any
+  const results: any[] = [];
 
   for (
     const [key, value] of Object.entries(
@@ -136,10 +147,12 @@ const BATCH_PATTERN = /\d+\s*~\s*\d+/;
 async function searchNyaa(
   query: string,
   resolution: string,
-  logger,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
   nyaaUser?: string,
   nyaaQuery?: string,
-): Promise<unknown[]> {
+  // deno-lint-ignore no-explicit-any
+): Promise<any[]> {
   const searchTerm = nyaaQuery ?? query;
   const params = new URLSearchParams({
     page: "rss",
@@ -165,7 +178,8 @@ async function searchNyaa(
   const itemList = Array.isArray(items) ? items : [items];
 
   const normalizedRes = resolution.replace(/p$/, "");
-  const results = [];
+  // deno-lint-ignore no-explicit-any
+  const results: any[] = [];
 
   for (const item of itemList) {
     const title = item.title;
@@ -212,12 +226,12 @@ async function searchNyaa(
 
 const EZTV_DEFAULT_URL = "https://myrss.org/eztv";
 
-async function searchEztv(
-  query: string,
-  resolution: string,
-  logger,
+async function fetchEztvFeed(
+  // deno-lint-ignore no-explicit-any
+  logger: any,
   eztvUrl?: string,
-): Promise<unknown[]> {
+  // deno-lint-ignore no-explicit-any
+): Promise<any[]> {
   const url = eztvUrl ?? EZTV_DEFAULT_URL;
   logger.info(`EZTV RSS: ${url}`);
 
@@ -231,25 +245,34 @@ async function searchEztv(
     isArray: (_name: string, jpath: string) => jpath === "rss.channel.item",
   });
   const feed = parser.parse(xml);
-  const items = feed?.rss?.channel?.item ?? [];
+  return feed?.rss?.channel?.item ?? [];
+}
 
+function matchEztvItems(
+  // deno-lint-ignore no-explicit-any
+  items: any[],
+  query: string,
+  resolution: string,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+  preferGroup?: string,
+  preferCodec?: string,
+  // deno-lint-ignore no-explicit-any
+): any[] {
   const normalizedRes = resolution.replace(/p$/, "");
   const normalizedQuery = query.toLowerCase();
-  const results = [];
+  // deno-lint-ignore no-explicit-any
+  const results: any[] = [];
 
   for (const item of items) {
     const title = item.title ?? item["torrent:fileName"];
     if (!title) continue;
 
-    // Filter by show name (case-insensitive substring match)
     if (!title.toLowerCase().includes(normalizedQuery)) continue;
-
-    // Resolution filter
     if (
       !title.includes(`${normalizedRes}p`) && !title.includes(normalizedRes)
     ) continue;
 
-    // Extract magnet — may be in torrent:magnetURI (possibly CDATA-wrapped)
     let magnet = item["torrent:magnetURI"] ?? "";
     if (typeof magnet === "object") magnet = magnet["#text"] ?? "";
     magnet = magnet.trim();
@@ -264,6 +287,13 @@ async function searchEztv(
 
     const seeders = parseInt(item["torrent:seeds"]) || 0;
 
+    // Quality scoring
+    const hasGroup = preferGroup ? title.includes(preferGroup) : false;
+    const hasCodec = preferCodec
+      ? title.includes(preferCodec) || title.includes(preferCodec.toLowerCase())
+      : false;
+    const score = (hasGroup ? 10 : 0) + (hasCodec ? 5 : 0);
+
     results.push({
       show: query,
       magnet,
@@ -273,10 +303,12 @@ async function searchEztv(
       rawTitle: title,
       publishDate: item.pubDate,
       seeders,
+      _score: score,
     });
   }
 
-  // Deduplicate by infoHash
+  // Deduplicate by infoHash, keep highest scored
+  results.sort((a, b) => b._score - a._score);
   const seen = new Set<string>();
   const deduped = results.filter((r) => {
     if (!r.infoHash) return true;
@@ -285,10 +317,54 @@ async function searchEztv(
     return true;
   });
 
+  // If we have quality prefs, only keep the best release per episode
+  if (preferGroup || preferCodec) {
+    // Extract S01E09 style episode key from title
+    // deno-lint-ignore no-explicit-any
+    const byEpisode = new Map<string, any>();
+    for (const r of deduped) {
+      const epMatch = r.rawTitle.match(/S\d+E\d+/i);
+      const key = epMatch ? epMatch[0].toUpperCase() : r.rawTitle;
+      const existing = byEpisode.get(key);
+      if (!existing || r._score > existing._score) {
+        byEpisode.set(key, r);
+      }
+    }
+    const best = [...byEpisode.values()].map(({ _score, ...rest }) => rest);
+    logger.info(
+      `EZTV: ${best.length} best matches for "${query}" at ${normalizedRes}p (preferred: ${
+        preferGroup ?? ""
+      } ${preferCodec ?? ""}) from ${items.length} raw`,
+    );
+    return best;
+  }
+
+  const clean = deduped.map(({ _score, ...rest }) => rest);
   logger.info(
-    `EZTV: ${deduped.length} items matching "${query}" at ${normalizedRes}p (from ${items.length} raw)`,
+    `EZTV: ${clean.length} items matching "${query}" at ${normalizedRes}p (from ${items.length} raw)`,
   );
-  return deduped;
+  return clean;
+}
+
+async function searchEztv(
+  query: string,
+  resolution: string,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+  eztvUrl?: string,
+  preferGroup?: string,
+  preferCodec?: string,
+  // deno-lint-ignore no-explicit-any
+): Promise<any[]> {
+  const items = await fetchEztvFeed(logger, eztvUrl);
+  return matchEztvItems(
+    items,
+    query,
+    resolution,
+    logger,
+    preferGroup,
+    preferCodec,
+  );
 }
 
 // --- Newznab (usenet indexers like althub, nzbgeek, etc.) ---
@@ -298,9 +374,11 @@ async function searchNewznab(
   resolution: string,
   apiUrl: string,
   apiKey: string,
-  logger,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
   category?: string,
-): Promise<unknown[]> {
+  // deno-lint-ignore no-explicit-any
+): Promise<any[]> {
   const params = new URLSearchParams({
     t: "tvsearch",
     q: query,
@@ -330,7 +408,8 @@ async function searchNewznab(
   const items = feed?.rss?.channel?.item ?? [];
 
   const normalizedRes = resolution.replace(/p$/, "");
-  const results = [];
+  // deno-lint-ignore no-explicit-any
+  const results: any[] = [];
 
   for (const item of items) {
     const title = item.title;
@@ -407,7 +486,7 @@ async function searchNewznab(
 
 export const model = {
   type: "@keeb/mms/source",
-  version: "2026.03.29.3",
+  version: "2026.03.30.1",
   reports: ["@keeb/mms/discovery-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -416,9 +495,11 @@ export const model = {
       toVersion: "2026.03.28.2",
       description:
         "Replace erai-raws provider with general nyaa provider, add ollama config",
-      upgradeAttributes: (old) => ({
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => ({
         ...old,
-        shows: old.shows?.map((s) => ({
+        // deno-lint-ignore no-explicit-any
+        shows: old.shows?.map((s: any) => ({
           ...s,
           provider: s.provider === "erai-raws" ? "nyaa" : s.provider,
           nyaaUser: s.provider === "erai-raws" ? "Erai-raws" : s.nyaaUser,
@@ -430,7 +511,8 @@ export const model = {
       toVersion: "2026.03.29.1",
       description:
         "Remove inline ollama — LLM parsing happens via @keeb/ollama model in workflow",
-      upgradeAttributes: (old) => {
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => {
         const { ollamaUrl: _ollamaUrl, ollamaModel: _ollamaModel, ...rest } =
           old;
         return rest;
@@ -440,14 +522,24 @@ export const model = {
       fromVersion: "2026.03.29.1",
       toVersion: "2026.03.29.2",
       description: "Add EZTV provider for western TV shows",
-      upgradeAttributes: (old) => old,
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
     },
     {
       fromVersion: "2026.03.29.2",
       toVersion: "2026.03.29.3",
       description:
         "Add Newznab provider for usenet indexers (althub, nzbgeek, etc.)",
-      upgradeAttributes: (old) => old,
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.03.29.3",
+      toVersion: "2026.03.30.1",
+      description:
+        "Add preferGroup/preferCodec quality scoring for EZTV, single-pull optimization",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
     },
   ],
   resources: {
@@ -469,6 +561,12 @@ export const model = {
           "Source provider",
         ),
         resolution: z.string().default("1080").describe("Resolution filter"),
+        preferGroup: z.string().optional().describe(
+          "Preferred release group (e.g. MeGusta)",
+        ),
+        preferCodec: z.string().optional().describe(
+          "Preferred codec (e.g. HEVC)",
+        ),
         nyaaUser: z.string().optional().describe("Nyaa uploader filter"),
         nyaaQuery: z.string().optional().describe("Override search query"),
         eztvUrl: z.string().optional().describe("Custom EZTV RSS URL"),
@@ -483,6 +581,8 @@ export const model = {
           query: string;
           provider: "subsplease" | "nyaa" | "eztv" | "newznab";
           resolution: string;
+          preferGroup?: string;
+          preferCodec?: string;
           nyaaUser?: string;
           nyaaQuery?: string;
           eztvUrl?: string;
@@ -490,7 +590,8 @@ export const model = {
           newznabApiKey?: string;
           newznabCat?: string;
         },
-        context,
+        // deno-lint-ignore no-explicit-any
+        context: any,
       ) => {
         const items = args.provider === "subsplease"
           ? await searchSubsPlease(args.query, args.resolution, context.logger)
@@ -500,6 +601,8 @@ export const model = {
             args.resolution,
             context.logger,
             args.eztvUrl,
+            args.preferGroup,
+            args.preferCodec,
           )
           : args.provider === "newznab"
           ? await searchNewznab(
@@ -518,7 +621,8 @@ export const model = {
             args.nyaaQuery,
           );
 
-        const handles = [];
+        // deno-lint-ignore no-explicit-any
+        const handles: any[] = [];
         for (const item of items) {
           const instanceName = slugify(
             item.infoHash
@@ -542,46 +646,72 @@ export const model = {
       description:
         "Search all configured shows (factory: one resource per item across all shows)",
       arguments: z.object({}),
-      execute: async (_args: Record<string, never>, context) => {
+      // deno-lint-ignore no-explicit-any
+      execute: async (_args: Record<string, never>, context: any) => {
         const shows = context.globalArgs.shows ?? [];
         if (shows.length === 0) {
           context.logger.info("No shows configured");
           return { dataHandles: [] };
         }
 
-        const handles = [];
+        // deno-lint-ignore no-explicit-any
+        const handles: any[] = [];
+
+        // Pull EZTV feed once for all eztv shows
+        // deno-lint-ignore no-explicit-any
+        const eztvShows = shows.filter((s: any) => s.provider === "eztv");
+        // deno-lint-ignore no-explicit-any
+        let eztvFeedItems: any[] | null = null;
+        if (eztvShows.length > 0) {
+          try {
+            eztvFeedItems = await fetchEztvFeed(
+              context.logger,
+              eztvShows[0].eztvUrl,
+            );
+          } catch (err) {
+            context.logger.error(`Failed to fetch EZTV feed: ${err}`);
+          }
+        }
 
         for (const show of shows) {
           try {
-            const items = show.provider === "subsplease"
-              ? await searchSubsPlease(
+            // deno-lint-ignore no-explicit-any
+            let items: any[];
+            if (show.provider === "eztv" && eztvFeedItems !== null) {
+              items = matchEztvItems(
+                eztvFeedItems,
                 show.name,
                 show.resolution ?? "1080",
                 context.logger,
-              )
-              : show.provider === "eztv"
-              ? await searchEztv(
+                show.preferGroup,
+                show.preferCodec,
+              );
+            } else if (show.provider === "subsplease") {
+              items = await searchSubsPlease(
                 show.name,
                 show.resolution ?? "1080",
                 context.logger,
-                show.eztvUrl,
-              )
-              : show.provider === "newznab"
-              ? await searchNewznab(
+              );
+            } else if (show.provider === "newznab") {
+              items = await searchNewznab(
                 show.name,
                 show.resolution ?? "1080",
                 show.newznabUrl!,
                 show.newznabApiKey!,
                 context.logger,
                 show.newznabCat,
-              )
-              : await searchNyaa(
+              );
+            } else if (show.provider === "nyaa") {
+              items = await searchNyaa(
                 show.name,
                 show.resolution ?? "1080",
                 context.logger,
                 show.nyaaUser,
                 show.nyaaQuery,
               );
+            } else {
+              continue;
+            }
 
             for (const item of items) {
               const instanceName = slugify(

@@ -1,0 +1,59 @@
+# Media Filename Parser
+
+Parse TV show, anime, and movie filenames into structured data.
+
+## Input Format
+Filename (with or without extension)
+
+## Output Format
+Return JSON with these fields:
+- `media_type`: "tv_show", "anime", "movie", or "book"
+- `title`: Clean title (spaces, proper capitalization)
+- `season`: Season number (integer, null for movies/books)  
+- `episode`: Episode number (integer, null for movies/books)
+- `volume`: Volume number (integer, null for non-books)
+- `episode_title`: Episode title if present (null if not found)
+- `year`: Release year if present (integer, null if not found)
+- `confidence`: High/Medium/Low based on pattern match quality
+
+## Detection Rules
+**Movie**: Single file, often has year, no season/episode markers
+**Anime**: Japanese titles, episode ranges like "01-12", "OVA", "Special"
+**TV Show**: Standard S##E## or #x## patterns, Western show names
+**Book**: Comic book archives (.cbz, .cbr), manga, graphic novels, often numbered volumes
+
+## Common Patterns
+- TV: `Show.Name.S01E01.Episode.Title.ext`
+- Anime: `Anime Title - 01 [1080p].mkv` or `Anime.Title.E01.ext`
+- Movie: `Movie Title (2023) 1080p.mp4`
+- Book: `Comic Title Vol 01.cbz` or `Manga Name - Chapter 001.cbr`
+
+## Special Cases (Anime Season Detection)
+These rules OVERRIDE the default season detection:
+- "Jujutsu Kaisen - Shimetsu Kaiyuu" or "Jujutsu Kaisen: Shimetsu Kaiyuu" → season: 3
+- "Jujutsu Kaisen 2nd Season" → season: 2
+- "Sousou no Frieren" or "Frieren" with "2nd Season" or "Season 2" → title: "Sousou no Frieren", season: 2
+- "Ao no Miburo" with "2nd Season" or "Season 2" → title: "Ao no Miburo", season: 2
+- Any anime with "2nd Season" in the title → season: 2
+- Any anime with "3rd Season" in the title → season: 3
+
+## Examples
+Input: `The.Sopranos.S01E01.Pilot.avi`
+Output: `{"media_type": "tv_show", "title": "The Sopranos", "season": 1, "episode": 1, "episode_title": "Pilot", "year": null, "confidence": "High"}`
+
+Input: `Attack on Titan - 01 [1080p].mkv`
+Output: `{"media_type": "anime", "title": "Attack on Titan", "season": null, "episode": 1, "episode_title": null, "year": null, "confidence": "High"}`
+
+Input: `The Matrix (1999) 1080p BluRay.mp4`
+Output: `{"media_type": "movie", "title": "The Matrix", "season": null, "episode": null, "episode_title": null, "year": 1999, "confidence": "High"}`
+
+Input: `Call of the Night v01 (2021) (Digital) (1r0n) (f2).cbz`
+Output: `{"media_type": "book", "title": "Call of the Night", "season": null, "episode": null, "volume": 1, "episode_title": null, "year": 2021, "confidence": "High"}`
+
+Input: `[Erai-raws] Jujutsu Kaisen: Shimetsu Kaiyuu - Zenpen - 05 [1080p]`
+Output: `{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 3, "episode": 5, "episode_title": null, "year": null, "confidence": "High"}`
+
+Input: `[Erai-raws] Jujutsu Kaisen 2nd Season - 23 [1080p]`
+Output: `{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 2, "episode": 23, "episode_title": null, "year": null, "confidence": "High"}`
+
+Parse the filename and return only the JSON response.

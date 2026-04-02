@@ -1,115 +1,8 @@
 import { z } from "npm:zod@4";
 import { MongoClient } from "npm:mongodb@6.12.0";
+import { ollamaGenerate } from "./_lib/ollama.ts";
 
-// --- Embedded LLM prompts (ported from prompts/) ---
-
-const FILENAME_TO_JSON_PROMPT = `# Media Filename Parser
-
-Parse TV show, anime, and movie filenames into structured data.
-
-## Input Format
-Filename (with or without extension)
-
-## Output Format
-Return JSON with these fields:
-- \`media_type\`: "tv_show", "anime", "movie", or "book"
-- \`title\`: Clean title (spaces, proper capitalization)
-- \`season\`: Season number (integer, null for movies/books)
-- \`episode\`: Episode number (integer, null for movies/books)
-- \`volume\`: Volume number (integer, null for non-books)
-- \`episode_title\`: Episode title if present (null if not found)
-- \`year\`: Release year if present (integer, null if not found)
-- \`confidence\`: High/Medium/Low based on pattern match quality
-
-## Detection Rules
-**Movie**: Single file, often has year, no season/episode markers
-**Anime**: Japanese titles, episode ranges like "01-12", "OVA", "Special"
-**TV Show**: Standard S##E## or #x## patterns, Western show names
-**Book**: Comic book archives (.cbz, .cbr), manga, graphic novels, often numbered volumes
-
-## Common Patterns
-- TV: \`Show.Name.S01E01.Episode.Title.ext\`
-- Anime: \`Anime Title - 01 [1080p].mkv\` or \`Anime.Title.E01.ext\`
-- Movie: \`Movie Title (2023) 1080p.mp4\`
-- Book: \`Comic Title Vol 01.cbz\` or \`Manga Name - Chapter 001.cbr\`
-
-## Special Cases (Anime Season Detection)
-These rules OVERRIDE the default season detection:
-- "Jujutsu Kaisen - Shimetsu Kaiyuu" or "Jujutsu Kaisen: Shimetsu Kaiyuu" → season: 3
-- "Jujutsu Kaisen 2nd Season" → season: 2
-- "Sousou no Frieren" or "Frieren" with "2nd Season" or "Season 2" → title: "Sousou no Frieren", season: 2
-- "Ao no Miburo" with "2nd Season" or "Season 2" → title: "Ao no Miburo", season: 2
-- Any anime with "2nd Season" in the title → season: 2
-- Any anime with "3rd Season" in the title → season: 3
-
-## Examples
-Input: \`The.Sopranos.S01E01.Pilot.avi\`
-Output: \`{"media_type": "tv_show", "title": "The Sopranos", "season": 1, "episode": 1, "episode_title": "Pilot", "year": null, "confidence": "High"}\`
-
-Input: \`Attack on Titan - 01 [1080p].mkv\`
-Output: \`{"media_type": "anime", "title": "Attack on Titan", "season": null, "episode": 1, "episode_title": null, "year": null, "confidence": "High"}\`
-
-Input: \`The Matrix (1999) 1080p BluRay.mp4\`
-Output: \`{"media_type": "movie", "title": "The Matrix", "season": null, "episode": null, "episode_title": null, "year": 1999, "confidence": "High"}\`
-
-Input: \`Call of the Night v01 (2021) (Digital) (1r0n) (f2).cbz\`
-Output: \`{"media_type": "book", "title": "Call of the Night", "season": null, "episode": null, "volume": 1, "episode_title": null, "year": 2021, "confidence": "High"}\`
-
-Input: \`[Erai-raws] Jujutsu Kaisen: Shimetsu Kaiyuu - Zenpen - 05 [1080p]\`
-Output: \`{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 3, "episode": 5, "episode_title": null, "year": null, "confidence": "High"}\`
-
-Input: \`[Erai-raws] Jujutsu Kaisen 2nd Season - 23 [1080p]\`
-Output: \`{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 2, "episode": 23, "episode_title": null, "year": null, "confidence": "High"}\`
-
-Parse the filename and return only the JSON response.`;
-
-const JSON_TO_SAVE_PATH_PROMPT =
-  `You are a media file path generator. Your job is to take JSON media metadata and return the correct storage path based on these rules:
-
-## Directory Structure:
-- Anime: {mediaRoot}/video/anime/completed/{show-name}
-- Movies: {mediaRoot}/video/movies
-- TV Shows: {mediaRoot}/video/shows/{show-name}
-- Books: {mediaRoot}/manga/{book-title}
-
-## Naming Rules:
-Follow these steps EXACTLY in order for EVERY title:
-1. Convert EVERY character to lowercase (A-Z becomes a-z)
-2. Replace ALL spaces with single hyphens
-3. Remove trailing separators (spaces, hyphens, dots, underscores)
-4. Remove duplicate hyphens (-- becomes -, --- becomes -, etc)
-5. Strip leading/trailing hyphens
-
-CRITICAL:
-- Each space character must become exactly one hyphen. Do not combine words.
-- EVERY letter must be lowercase. If you see any uppercase letters, convert them.
-
-## Path Generation Logic:
-
-**For Anime (media_type: "anime"):**
-- Base path: {mediaRoot}/video/anime/completed/
-- Append normalized title as directory name
-- If season is provided, append /s{season_number}
-
-**For Movies (media_type: "movie"):**
-- Path: {mediaRoot}/video/movies
-- Movies go directly in the movies folder, not in subdirectories
-
-**For TV Shows (media_type: "tv" or "tv_show"):**
-- Base path: {mediaRoot}/video/shows/
-- Append normalized title as directory name
-- If season is provided, append /s{season_number}
-- NEVER create episode subdirectories
-- ALL episodes from the same season go in the SAME season directory
-
-**For Books (media_type: "book"):**
-- Base path: {mediaRoot}/manga/
-- Append normalized title as directory name
-- If volume is provided, append /v{volume_number}
-- NEVER create chapter subdirectories
-
-## Output Format:
-Return only the complete directory path as a string, no additional text or formatting.`;
+// Prompts loaded at runtime from prompts/ via context.repoDir
 
 // --- Video file detection ---
 
@@ -133,43 +26,6 @@ const VIDEO_EXTENSIONS = new Set([
 function isVideoFile(filename: string): boolean {
   const ext = filename.slice(filename.lastIndexOf(".")).toLowerCase();
   return VIDEO_EXTENSIONS.has(ext);
-}
-
-// --- Ollama HTTP client ---
-
-async function ollamaGenerate(
-  ollamaUrl: string,
-  model: string,
-  prompt: string,
-  input: string,
-): Promise<string> {
-  const fullPrompt = `${prompt}\n\n${input}`;
-  const resp = await fetch(`${ollamaUrl}/api/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      prompt: fullPrompt,
-      stream: false,
-      options: { num_predict: 1024 },
-    }),
-  });
-
-  if (!resp.ok) {
-    throw new Error(
-      `Ollama generate failed (${resp.status}): ${await resp.text()}`,
-    );
-  }
-
-  const json = await resp.json();
-  let response = (json.response ?? "").trim();
-
-  // Strip markdown code block wrappers
-  if (response.startsWith("```")) {
-    response = response.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-  }
-
-  return response;
 }
 
 async function ollamaHealthCheck(ollamaUrl: string): Promise<void> {
@@ -247,7 +103,8 @@ export const model = {
           .default(5)
           .describe("Maximum number of jobs to process in this run"),
       }),
-      execute: async (args: { maxJobs: number }, context) => {
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: { maxJobs: number }, context: any) => {
         const {
           mongodbUri,
           database,
@@ -256,6 +113,14 @@ export const model = {
           stagingDir,
           mediaRoot,
         } = context.globalArgs;
+
+        // Load prompts from canonical files
+        const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
+          `${context.repoDir}/prompts/filename-to-json.prompt`,
+        );
+        const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
+          `${context.repoDir}/prompts/json-to-save-path.prompt`,
+        );
 
         // Health check Ollama before popping any jobs
         await ollamaHealthCheck(ollamaUrl);
@@ -267,7 +132,8 @@ export const model = {
           const db = client.db(database);
           const jobs = db.collection("jobs");
 
-          const handles = [];
+          // deno-lint-ignore no-explicit-any
+          const handles: any[] = [];
           let processed = 0;
 
           while (processed < args.maxJobs) {
@@ -332,7 +198,8 @@ export const model = {
               }
 
               // Process each video file
-              let lastMetadata = null;
+              // deno-lint-ignore no-explicit-any
+              let lastMetadata: any = null;
               let lastDest = "";
 
               for (const file of filesToProcess) {
@@ -344,7 +211,8 @@ export const model = {
                   file.name,
                 );
 
-                let metadata;
+                // deno-lint-ignore no-explicit-any
+                let metadata: any;
                 try {
                   metadata = JSON.parse(metadataJson);
                 } catch {
@@ -357,9 +225,10 @@ export const model = {
                 lastMetadata = metadata;
 
                 // Stage 2: JSON → save path
-                // Inject mediaRoot into the prompt
+                // The canonical prompt has /home/keeb/media hardcoded;
+                // replace with the configured mediaRoot
                 const pathPrompt = JSON_TO_SAVE_PATH_PROMPT.replaceAll(
-                  "{mediaRoot}",
+                  "/home/keeb/media",
                   mediaRoot,
                 );
                 const destPath = (
@@ -467,8 +336,10 @@ export const model = {
 // --- Helpers ---
 
 async function markFailed(
-  collection,
-  id,
+  // deno-lint-ignore no-explicit-any
+  collection: any,
+  // deno-lint-ignore no-explicit-any
+  id: any,
   error: string,
 ): Promise<void> {
   await collection.updateOne(
@@ -487,7 +358,8 @@ async function moveFile(
   srcPath: string,
   destDir: string,
   filename: string,
-  logger,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
 ): Promise<void> {
   // Create destination directory
   await Deno.mkdir(destDir, { recursive: true });
@@ -506,7 +378,8 @@ async function moveFile(
     throw new Error(
       `Destination exists with different size: ${destPath} (src=${srcStat.size}, dest=${destStat.size})`,
     );
-  } catch (err) {
+    // deno-lint-ignore no-explicit-any
+  } catch (err: any) {
     if (err instanceof Deno.errors.NotFound) {
       // Destination doesn't exist — proceed with move
     } else if (err.message?.includes("Destination exists")) {
