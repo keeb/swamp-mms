@@ -1,3 +1,8 @@
+/**
+ * `@keeb/mms/organizer` model type — pop pending jobs from a MongoDB queue,
+ * classify filenames with an Ollama-driven two-stage prompt, and move files
+ * into the organized media tree.
+ */
 import { z } from "npm:zod@4";
 import { MongoClient } from "npm:mongodb@6.12.0";
 import { ollamaGenerate } from "./_lib/ollama.ts";
@@ -81,6 +86,7 @@ const JobSchema = z.object({
 
 // --- Model ---
 
+/** Swamp model definition for `@keeb/mms/organizer`. */
 export const model = {
   type: "@keeb/mms/organizer",
   version: "2026.03.28.1",

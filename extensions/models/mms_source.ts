@@ -1,3 +1,8 @@
+/**
+ * `@keeb/mms/source` model type — content discovery from SubsPlease, Nyaa,
+ * EZTV, and Newznab feeds. Normalizes per-provider results into a shared
+ * `episode` resource shape for downstream dedup and download stages.
+ */
 import { z } from "npm:zod@4";
 import { XMLParser } from "npm:fast-xml-parser@4.5.1";
 
@@ -484,6 +489,7 @@ async function searchNewznab(
 
 // --- Model ---
 
+/** Swamp model definition for `@keeb/mms/source`. */
 export const model = {
   type: "@keeb/mms/source",
   version: "2026.03.30.1",

@@ -1,3 +1,9 @@
+/**
+ * `@keeb/mms/dedup` model type — filter discovered episodes against the
+ * local filesystem so only episodes that aren't already on disk are kept.
+ * Uses regex title parsing first and falls back to an Ollama call only when
+ * regex can't extract show/episode.
+ */
 import { z } from "npm:zod@4";
 import { ollamaGenerate } from "./_lib/ollama.ts";
 
@@ -170,6 +176,7 @@ async function fileExistsForEpisode(
 
 // --- Model ---
 
+/** Swamp model definition for `@keeb/mms/dedup`. */
 export const model = {
   type: "@keeb/mms/dedup",
   version: "2026.03.29.1",

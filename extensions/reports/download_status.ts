@@ -1,3 +1,9 @@
+/**
+ * `@keeb/mms/download-status` report — render the current Transmission and
+ * SABnzbd download state as a markdown list grouped by status.
+ */
+
+/** Swamp report definition for `@keeb/mms/download-status`. */
 export const report = {
   name: "@keeb/mms/download-status",
   description: "Show active downloads with name, progress, and state",

@@ -1,3 +1,9 @@
+/**
+ * `@keeb/mms/dedup-summary` report — summarize the output of a dedup filter
+ * run: count of new episodes grouped by show.
+ */
+
+/** Swamp report definition for `@keeb/mms/dedup-summary`. */
 export const report = {
   name: "@keeb/mms/dedup-summary",
   description: "Summarize dedup filter results: what's new vs what was skipped",

@@ -1,3 +1,8 @@
+/**
+ * `@keeb/mms/downloader` model type — add, list, remove, and clean downloads
+ * across Transmission (for torrents) and SABnzbd (for usenet), routing each
+ * download to the correct backend by protocol.
+ */
 import { z } from "npm:zod@4";
 
 // --- Transmission RPC helpers ---
@@ -85,9 +90,18 @@ const DownloadSchema = z.object({
 
 // --- Model ---
 
+/** Swamp model definition for `@keeb/mms/downloader`. */
 export const model = {
   type: "@keeb/mms/downloader",
-  version: "2026.03.28.1",
+  version: "2026.04.02.3",
+  upgrades: [
+    {
+      fromVersion: "2026.03.28.1",
+      toVersion: "2026.04.02.3",
+      description: "Add remove method for selective torrent deletion",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   reports: ["@keeb/mms/download-status"],
   globalArguments: GlobalArgsSchema,
   resources: {
@@ -322,6 +336,108 @@ export const model = {
         }
 
         return { dataHandles: handles };
+      },
+    },
+
+    remove: {
+      description: "Remove specific torrents from Transmission by name filter",
+      arguments: z.object({
+        filter: z
+          .string()
+          .describe(
+            "Substring to match against torrent names (case-insensitive)",
+          ),
+        deleteData: z
+          .boolean()
+          .default(true)
+          .describe("Also delete downloaded files from disk"),
+      }),
+      execute: async (
+        args: { filter: string; deleteData: boolean },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const { transmissionUrl, transmissionUser, transmissionPassword } =
+          context.globalArgs;
+        if (!transmissionUrl) {
+          throw new Error("transmissionUrl is required");
+        }
+
+        const auth = transmissionUser && transmissionPassword
+          ? { user: transmissionUser, password: transmissionPassword }
+          : undefined;
+
+        const { result, sessionId } = await transmissionRpc(
+          transmissionUrl,
+          "torrent-get",
+          { fields: ["id", "name", "status", "percentDone"] },
+          auth,
+        );
+
+        // deno-lint-ignore no-explicit-any
+        const torrents: any[] = (result as any).arguments?.torrents ?? [];
+        const filterLower = args.filter.toLowerCase();
+
+        const idsToRemove: number[] = [];
+        const namesRemoved: string[] = [];
+
+        for (const t of torrents) {
+          const name: string = (t.name ?? "").toLowerCase();
+          if (!name.includes(filterLower)) continue;
+          idsToRemove.push(t.id);
+          namesRemoved.push(t.name);
+        }
+
+        if (idsToRemove.length === 0) {
+          context.logger.info(
+            `No torrents matched filter "${args.filter}"`,
+          );
+          const handle = await context.writeResource(
+            "download",
+            "remove-result",
+            {
+              id: "remove",
+              name: `No torrents matched "${args.filter}"`,
+              uri: "",
+              protocol: "torrent" as const,
+              status: "cleaned",
+              backend: "transmission",
+              addedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        await transmissionRpc(
+          transmissionUrl,
+          "torrent-remove",
+          { ids: idsToRemove, "delete-local-data": args.deleteData },
+          auth,
+          sessionId,
+        );
+
+        context.logger.info(
+          `Removed ${idsToRemove.length} torrents matching "${args.filter}"`,
+        );
+        for (const n of namesRemoved) {
+          context.logger.info(`  removed: ${n}`);
+        }
+
+        const handle = await context.writeResource(
+          "download",
+          "remove-result",
+          {
+            id: "remove",
+            name:
+              `Removed ${idsToRemove.length} torrents matching "${args.filter}"`,
+            uri: "",
+            protocol: "torrent" as const,
+            status: "cleaned",
+            backend: "transmission",
+            addedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
       },
     },
 

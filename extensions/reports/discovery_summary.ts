@@ -1,3 +1,9 @@
+/**
+ * `@keeb/mms/discovery-summary` report — summarize raw and parsed items
+ * discovered by an `@keeb/mms/source` search, grouped by show and provider.
+ */
+
+/** Swamp report definition for `@keeb/mms/discovery-summary`. */
 export const report = {
   name: "@keeb/mms/discovery-summary",
   description: "Summarize discovered content from source searches",
