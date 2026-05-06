@@ -1,8 +1,3 @@
-/**
- * `@keeb/mms/source` model type — content discovery from SubsPlease, Nyaa,
- * EZTV, and Newznab feeds. Normalizes per-provider results into a shared
- * `episode` resource shape for downstream dedup and download stages.
- */
 import { z } from "npm:zod@4";
 import { XMLParser } from "npm:fast-xml-parser@4.5.1";
 
@@ -48,7 +43,13 @@ const ShowConfigSchema = z.object({
   newznabCat: z
     .string()
     .optional()
-    .describe("Newznab category ID (e.g. 5040 for TV HD)"),
+    .describe("Newznab category ID (e.g. 5040 for TV HD, 2040 for Movies HD)"),
+  newznabSearchType: z
+    .enum(["tvsearch", "search", "movie"])
+    .optional()
+    .describe(
+      "Newznab API endpoint: tvsearch (default, TV episodes), search (general), movie",
+    ),
 });
 
 const GlobalArgsSchema = z.object({
@@ -78,6 +79,16 @@ const EpisodeSchema = z.object({
     "Download protocol",
   ),
   size: z.number().optional().describe("File size in bytes"),
+});
+
+// Manifest of every item from a single search invocation. Single-instance
+// resource (name "current") that supersedes on each run — `data.latest(<model>,
+// "episodes")` always returns exactly this run's results. No per-episode
+// factory resources; the aggregate is the source of truth.
+const EpisodesSchema = z.object({
+  episodes: z.array(EpisodeSchema).describe("All items from this run"),
+  count: z.number().describe("Number of items in this run"),
+  timestamp: z.string().describe("ISO timestamp when the run finished"),
 });
 
 // --- SubsPlease ---
@@ -382,20 +393,31 @@ async function searchNewznab(
   // deno-lint-ignore no-explicit-any
   logger: any,
   category?: string,
+  searchType?: "tvsearch" | "search" | "movie",
   // deno-lint-ignore no-explicit-any
 ): Promise<any[]> {
+  // Default to general `search` so movies, TV, and uncategorized releases all
+  // come back. Callers can narrow with searchType=tvsearch (cat 5040 default)
+  // or searchType=movie (cat 2040 default).
+  const t = searchType ?? "search";
+  const defaultCat = t === "tvsearch"
+    ? "5040"
+    : t === "movie"
+    ? "2040"
+    : undefined;
+  const cat = category ?? defaultCat;
   const params = new URLSearchParams({
-    t: "tvsearch",
+    t,
     q: query,
     apikey: apiKey,
-    cat: category ?? "5040", // TV HD
     limit: "100",
   });
+  if (cat) params.set("cat", cat);
 
   const url = `${apiUrl}/api?${params}`;
   logger.info(
-    `Newznab: ${apiUrl}/api?t=tvsearch&q=${encodeURIComponent(query)}&cat=${
-      category ?? "5040"
+    `Newznab: ${apiUrl}/api?t=${t}&q=${encodeURIComponent(query)}${
+      cat ? `&cat=${cat}` : ""
     }`,
   );
 
@@ -489,10 +511,9 @@ async function searchNewznab(
 
 // --- Model ---
 
-/** Swamp model definition for `@keeb/mms/source`. */
 export const model = {
   type: "@keeb/mms/source",
-  version: "2026.03.30.1",
+  version: "2026.05.04.1",
   reports: ["@keeb/mms/discovery-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -547,20 +568,64 @@ export const model = {
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
+    {
+      fromVersion: "2026.03.30.1",
+      toVersion: "2026.04.08.1",
+      description:
+        "Add `batch` resource spec — single 'latest' instance written per " +
+        "invocation, supersedes the previous version. Lets dedup scope to " +
+        "exactly the latest run's results without catalog accumulation.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.04.08.1",
+      toVersion: "2026.04.11.1",
+      description:
+        "Append content hash to slug when truncated past 80 chars so " +
+        "long show names with episode-number suffixes don't collide.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.04.11.1",
+      toVersion: "2026.04.14.1",
+      description:
+        "Drop per-episode factory resources — search results are pipeline " +
+        "output (a materialized view of the upstream catalog), not durable " +
+        "entities. The aggregate resource (now renamed `episodes`) is the " +
+        "sole output and source of truth. Orphaned `episode` records from " +
+        "prior versions can be purged with `swamp data gc`.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.04.14.1",
+      toVersion: "2026.05.04.1",
+      description:
+        "Make Newznab search endpoint configurable (newznabSearchType: " +
+        "tvsearch | search | movie). Default remains tvsearch.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
   ],
   resources: {
-    episode: {
+    episodes: {
       description:
-        "Discovered content from source (raw for nyaa, structured for subsplease)",
-      schema: EpisodeSchema,
+        "All items from the most recent invocation. Single instance named " +
+        "'current' that supersedes on each run — `data.latest(<model>, " +
+        "\"episodes\")` always returns this run's results and only this " +
+        "run's results.",
+      schema: EpisodesSchema,
       lifetime: "infinite" as const,
-      garbageCollection: 50,
+      garbageCollection: 5,
     },
   },
   methods: {
     search: {
       description:
-        "Search a provider for content (factory: one resource per item)",
+        "Search a provider for content. Writes a single `episodes` resource " +
+        "containing all items from this run.",
       arguments: z.object({
         query: z.string().describe("Show name to search for"),
         provider: z.enum(["subsplease", "nyaa", "eztv", "newznab"]).describe(
@@ -581,6 +646,12 @@ export const model = {
           "Newznab API key",
         ),
         newznabCat: z.string().optional().describe("Newznab category ID"),
+        newznabSearchType: z
+          .enum(["tvsearch", "search", "movie"])
+          .optional()
+          .describe(
+            "Newznab API endpoint (default: search — broad across all categories)",
+          ),
       }),
       execute: async (
         args: {
@@ -595,6 +666,7 @@ export const model = {
           newznabUrl?: string;
           newznabApiKey?: string;
           newznabCat?: string;
+          newznabSearchType?: "tvsearch" | "search" | "movie";
         },
         // deno-lint-ignore no-explicit-any
         context: any,
@@ -618,6 +690,7 @@ export const model = {
             args.newznabApiKey!,
             context.logger,
             args.newznabCat,
+            args.newznabSearchType,
           )
           : await searchNyaa(
             args.query,
@@ -627,30 +700,19 @@ export const model = {
             args.nyaaQuery,
           );
 
-        // deno-lint-ignore no-explicit-any
-        const handles: any[] = [];
-        for (const item of items) {
-          const instanceName = slugify(
-            item.infoHash
-              ? `${item.provider}-${item.infoHash.slice(0, 16)}`
-              : `${item.provider}-${
-                item.rawTitle ?? item.show + "-" + (item.episode ?? "unknown")
-              }`,
-          );
-          const handle = await context.writeResource(
-            "episode",
-            instanceName,
-            item,
-          );
-          handles.push(handle);
-        }
-        return { dataHandles: handles };
+        const handle = await context.writeResource("episodes", "current", {
+          episodes: items,
+          count: items.length,
+          timestamp: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
       },
     },
 
     search_configured: {
       description:
-        "Search all configured shows (factory: one resource per item across all shows)",
+        "Search all configured shows. Writes a single `episodes` resource " +
+        "containing every item discovered across all shows in this run.",
       arguments: z.object({}),
       // deno-lint-ignore no-explicit-any
       execute: async (_args: Record<string, never>, context: any) => {
@@ -660,8 +722,10 @@ export const model = {
           return { dataHandles: [] };
         }
 
+        // Accumulate every item across every show so we can write a single
+        // aggregate resource at the end.
         // deno-lint-ignore no-explicit-any
-        const handles: any[] = [];
+        const allItems: any[] = [];
 
         // Pull EZTV feed once for all eztv shows
         // deno-lint-ignore no-explicit-any
@@ -706,6 +770,7 @@ export const model = {
                 show.newznabApiKey!,
                 context.logger,
                 show.newznabCat,
+                show.newznabSearchType,
               );
             } else if (show.provider === "nyaa") {
               items = await searchNyaa(
@@ -719,22 +784,7 @@ export const model = {
               continue;
             }
 
-            for (const item of items) {
-              const instanceName = slugify(
-                item.infoHash
-                  ? `${item.provider}-${item.infoHash.slice(0, 16)}`
-                  : `${item.provider}-${
-                    item.rawTitle ??
-                      item.show + "-" + (item.episode ?? "unknown")
-                  }`,
-              );
-              const handle = await context.writeResource(
-                "episode",
-                instanceName,
-                item,
-              );
-              handles.push(handle);
-            }
+            allItems.push(...items);
           } catch (err) {
             context.logger.error(
               `Failed "${show.name}" on ${show.provider}: ${err}`,
@@ -742,19 +792,17 @@ export const model = {
           }
         }
 
+        const handle = await context.writeResource("episodes", "current", {
+          episodes: allItems,
+          count: allItems.length,
+          timestamp: new Date().toISOString(),
+        });
+
         context.logger.info(
-          `Total: ${handles.length} items across ${shows.length} shows`,
+          `Total: ${allItems.length} items across ${shows.length} shows`,
         );
-        return { dataHandles: handles };
+        return { dataHandles: [handle] };
       },
     },
   },
 };
-
-function slugify(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
-}

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/mms"
-version: "2026.04.27.1"
+version: "2026.05.06.1"
 description: "Media management system — content discovery, deduplication, download protocol handling, LLM-powered file organization, and subtitle extraction"
 repository: https://github.com/keeb/swamp-mms
 platforms: []

@@ -1,9 +1,3 @@
-/**
- * `@keeb/mms/dedup` model type — filter discovered episodes against the
- * local filesystem so only episodes that aren't already on disk are kept.
- * Uses regex title parsing first and falls back to an Ollama call only when
- * regex can't extract show/episode.
- */
 import { z } from "npm:zod@4";
 import { ollamaGenerate } from "./_lib/ollama.ts";
 
@@ -39,6 +33,18 @@ const EpisodeSchema = z.object({
   publishDate: z.string().optional().describe("RSS publish date"),
   rawTitle: z.string().optional().describe("Original unparsed title"),
   size: z.number().optional().describe("File size in bytes"),
+});
+
+// Actionable episodes from a single dedup invocation. Single-instance
+// resource (name "current") that supersedes on each run. Mirrors the
+// @keeb/mms/source `episodes` spec — downstream consumers read this via
+// `data.latest("dedup", "episodes")`.
+const EpisodesSchema = z.object({
+  episodes: z.array(EpisodeSchema).describe(
+    "Actionable episodes from this run (post disk-check, post HEVC/MeGusta dedup)",
+  ),
+  count: z.number().describe("Number of actionable episodes"),
+  timestamp: z.string().describe("ISO timestamp when the run finished"),
 });
 
 // --- Regex title parser (fast path, avoids LLM) ---
@@ -98,88 +104,62 @@ function slugDir(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-async function fileExistsForEpisode(
-  show: string,
-  episode: string,
-  season: string | undefined,
+async function buildFileIndex(
   dirs: string[],
   // deno-lint-ignore no-explicit-any
   logger: any,
-): Promise<boolean> {
-  const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
-  const normalizedShow = normalize(show);
-  const showSlug = slugDir(show);
-  const epPattern = new RegExp(`[\\s\\-_\\.E]0?${epPadded}[\\s\\.\\[\\(v\\-]`);
+): Promise<{ name: string; normalized: string; path: string }[]> {
+  const files: { name: string; normalized: string; path: string }[] = [];
 
-  for (const dir of dirs) {
-    // Check organized season dirs: {dir}/{show-slug}/s{season}/*
-    if (season) {
-      try {
-        const seasonPath = `${dir}/${showSlug}/s${season}`;
-        for await (const file of Deno.readDir(seasonPath)) {
-          if (file.isDirectory) continue;
-          if (epPattern.test(file.name)) {
-            logger.info(`Found: ${seasonPath}/${file.name}`);
-            return true;
-          }
-        }
-      } catch { /* doesn't exist */ }
-    }
-
-    // Check all season subdirs: {dir}/{show-slug}/s*/*
+  async function crawl(dir: string) {
     try {
-      const showDir = `${dir}/${showSlug}`;
-      for await (const seasonEntry of Deno.readDir(showDir)) {
-        if (!seasonEntry.isDirectory) continue;
-        const seasonPath = `${showDir}/${seasonEntry.name}`;
-        for await (const file of Deno.readDir(seasonPath)) {
-          if (file.isDirectory) continue;
-          if (
-            epPattern.test(file.name) &&
-            normalize(file.name).includes(normalizedShow)
-          ) {
-            logger.info(`Found: ${seasonPath}/${file.name}`);
-            return true;
-          }
-        }
-      }
-    } catch { /* doesn't exist */ }
-
-    // Check flat show dir: {dir}/{show-slug}/*
-    try {
-      const showDir = `${dir}/${showSlug}`;
-      for await (const file of Deno.readDir(showDir)) {
-        if (file.isDirectory) continue;
-        if (epPattern.test(file.name)) {
-          logger.info(`Found: ${showDir}/${file.name}`);
-          return true;
-        }
-      }
-    } catch { /* doesn't exist */ }
-
-    // Check flat staging: {dir}/* — match show name + episode in filename
-    try {
-      for await (const file of Deno.readDir(dir)) {
-        if (file.isDirectory) continue;
-        if (normalizedShow && normalize(file.name).includes(normalizedShow)) {
-          if (epPattern.test(file.name)) {
-            logger.info(`Found in staging: ${dir}/${file.name}`);
-            return true;
-          }
+      for await (const entry of Deno.readDir(dir)) {
+        const fullPath = `${dir}/${entry.name}`;
+        if (entry.isDirectory) {
+          await crawl(fullPath);
+        } else {
+          files.push({
+            name: entry.name,
+            normalized: normalize(entry.name),
+            path: fullPath,
+          });
         }
       }
     } catch { /* doesn't exist */ }
   }
 
+  for (const dir of dirs) {
+    await crawl(dir);
+  }
+  logger.info(`File index: ${files.length} files across ${dirs.length} dirs`);
+  return files;
+}
+
+function fileExistsInIndex(
+  show: string,
+  episode: string,
+  fileIndex: { name: string; normalized: string; path: string }[],
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+): boolean {
+  const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
+  const normalizedShow = normalize(show);
+  const epPattern = new RegExp(`[\\s\\-_\\.E]0?${epPadded}[\\s\\.\\[\\(v\\-]`);
+
+  for (const file of fileIndex) {
+    if (file.normalized.includes(normalizedShow) && epPattern.test(file.name)) {
+      logger.info(`Found: ${file.path}`);
+      return true;
+    }
+  }
   return false;
 }
 
 // --- Model ---
 
-/** Swamp model definition for `@keeb/mms/dedup`. */
 export const model = {
   type: "@keeb/mms/dedup",
-  version: "2026.03.29.1",
+  version: "2026.04.14.1",
   reports: ["@keeb/mms/dedup-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -195,13 +175,40 @@ export const model = {
         ollamaModel: old.ollamaModel ?? "qwen3:14b",
       }),
     },
+    {
+      fromVersion: "2026.03.29.1",
+      toVersion: "2026.04.08.1",
+      description:
+        "Add `batch` resource spec — single 'current' instance written per " +
+        "invocation containing the actionable episodes. Lets workflow forEach " +
+        "iterate this run's results without filtering by workflowRunId.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.04.08.1",
+      toVersion: "2026.04.14.1",
+      description:
+        "Drop per-episode factory resources — dedup output is pipeline " +
+        "output, not a set of durable entities. The aggregate resource " +
+        "(renamed from `batch` → `episodes`) is the sole output. Downstream " +
+        "consumers now query `data.latest(\"dedup\", \"episodes\")`. Orphaned " +
+        "`episode` and `batch` records from prior versions can be purged " +
+        "with `swamp data gc`.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
   ],
   resources: {
-    episode: {
-      description: "Episode that does not exist locally (new, actionable)",
-      schema: EpisodeSchema,
+    episodes: {
+      description:
+        "All actionable episodes from the most recent invocation. Single " +
+        "instance named 'current' that supersedes on each run — " +
+        "`data.latest(\"dedup\", \"episodes\")` always returns this run's " +
+        "results and only this run's results.",
+      schema: EpisodesSchema,
       lifetime: "infinite" as const,
-      garbageCollection: 50,
+      garbageCollection: 5,
     },
   },
   methods: {
@@ -222,8 +229,28 @@ export const model = {
           `${context.repoDir}/prompts/filename-to-json.prompt`,
         );
 
-        // Read source model data using first-class API
-        const items = await context.readModelData(args.sourceModel, "episode");
+        // Read the source model's latest run — a single aggregate record
+        // containing every item from the most recent invocation, superseded
+        // on each run. This gives us "exactly the source's most recent
+        // results," not accumulated catalog state.
+        //
+        // The `has(attributes.episodes)` clause forces the catalog to lazy-load
+        // the JSON content (the query service skips parsing unless the predicate
+        // references `attributes`).
+        const records = await context.queryData(
+          `modelName == "${args.sourceModel}" && specName == "episodes" && has(attributes.episodes)`,
+        );
+        if (records.length === 0) {
+          context.logger.info(
+            `No episodes resource found for "${args.sourceModel}" — has it been run yet?`,
+          );
+          return { dataHandles: [] };
+        }
+        // deno-lint-ignore no-explicit-any
+        const items = ((records[0].attributes.episodes as any[]) ?? []).map((
+          // deno-lint-ignore no-explicit-any
+          ep: any,
+        ) => ({ attributes: ep }));
         if (items.length === 0) {
           context.logger.info(`No data found for "${args.sourceModel}"`);
           return { dataHandles: [] };
@@ -232,6 +259,9 @@ export const model = {
         context.logger.info(
           `Read ${items.length} episodes from "${args.sourceModel}"`,
         );
+
+        // Build file index once
+        const fileIndex = await buildFileIndex(checkDirs, context.logger);
 
         // deno-lint-ignore no-explicit-any
         const handles: any[] = [];
@@ -247,22 +277,23 @@ export const model = {
           let show = data.show;
           let episode = data.episode;
           let season = data.season;
+          const isSubsPlease = data.provider === "subsplease";
 
-          // If no episode field, try regex first, then LLM as fallback
-          if (!episode && data.rawTitle) {
+          // Nyaa items: always extract show/season/episode from rawTitle
+          // SubsPlease items: already have show+episode, skip parsing
+          if (!isSubsPlease && data.rawTitle) {
+            // Try regex first
             const regexParsed = regexParseTitle(data.rawTitle);
-            if (regexParsed) {
+            if (regexParsed && regexParsed.season) {
               show = regexParsed.show;
               episode = regexParsed.episode;
               season = regexParsed.season;
               regexParsedCount++;
               context.logger.info(
-                `Regex: "${data.rawTitle.slice(0, 60)}" → ${show} s${
-                  season ?? "?"
-                } ep ${episode}`,
+                `Regex: "${data.rawTitle.slice(0, 60)}" → ${show} s${season} ep ${episode}`,
               );
             } else {
-              // Fall back to LLM for titles regex can't handle
+              // LLM for full extraction (show, season, episode)
               try {
                 const jsonStr = await ollamaGenerate(
                   ollamaUrl,
@@ -301,13 +332,24 @@ export const model = {
           if (!show || !episode) continue;
           checked++;
 
-          const exists = await fileExistsForEpisode(
-            show,
-            episode,
-            season,
-            checkDirs,
-            context.logger,
-          );
+          let exists: boolean;
+          if (isSubsPlease) {
+            // Fast path: exact filename match in crawled index
+            exists = fileExistsInIndex(
+              show,
+              episode,
+              fileIndex,
+              context.logger,
+            );
+          } else {
+            // Structured path: {dir}/{show-slug}/s{season}/ for parsed Nyaa items
+            exists = fileExistsInIndex(
+              show,
+              episode,
+              fileIndex,
+              context.logger,
+            );
+          }
 
           if (exists) {
             skipped++;
@@ -359,25 +401,18 @@ export const model = {
           }
         }
 
-        // Write only the deduplicated winners
-        // deno-lint-ignore no-explicit-any
-        const finalHandles: any[] = [];
-        for (const h of byEpisode.values()) {
-          const instanceName = slugDir(
-            `${h._provider}-${h._show}-s${h._season ?? "0"}-e${h._episode}`,
-          ).slice(0, 80);
-          const handle = await context.writeResource(
-            "episode",
-            instanceName,
-            h._data,
-          );
-          finalHandles.push(handle);
-        }
+        const finalEpisodes = [...byEpisode.values()].map((h) => h._data);
+
+        const handle = await context.writeResource("episodes", "current", {
+          episodes: finalEpisodes,
+          count: finalEpisodes.length,
+          timestamp: new Date().toISOString(),
+        });
 
         context.logger.info(
-          `Checked ${checked}: ${finalHandles.length} new (${handles.length} before dedup), ${skipped} on disk, ${regexParsedCount} regex-parsed, ${llmParsed} LLM-parsed`,
+          `Checked ${checked}: ${finalEpisodes.length} new (${handles.length} before dedup), ${skipped} on disk, ${regexParsedCount} regex-parsed, ${llmParsed} LLM-parsed`,
         );
-        return { dataHandles: finalHandles };
+        return { dataHandles: [handle] };
       },
     },
   },

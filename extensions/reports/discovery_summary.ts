@@ -1,9 +1,3 @@
-/**
- * `@keeb/mms/discovery-summary` report — summarize raw and parsed items
- * discovered by an `@keeb/mms/source` search, grouped by show and provider.
- */
-
-/** Swamp report definition for `@keeb/mms/discovery-summary`. */
 export const report = {
   name: "@keeb/mms/discovery-summary",
   description: "Summarize discovered content from source searches",
@@ -18,7 +12,8 @@ export const report = {
     const modelType = context.modelType;
     const modelId = context.definition.id;
 
-    // Read attributes from each data handle
+    // The source model writes a single `episodes` resource whose attributes
+    // contain the full run's episodes array.
     const items: {
       show: string;
       episode?: string;
@@ -36,13 +31,14 @@ export const report = {
       if (!content) continue;
       try {
         const data = JSON.parse(new TextDecoder().decode(content));
-        if (data.show || data.rawTitle) {
+        // deno-lint-ignore no-explicit-any
+        for (const ep of (data.episodes ?? []) as any[]) {
           items.push({
-            show: data.show ?? "unknown",
-            episode: data.episode,
-            provider: data.provider ?? "unknown",
-            resolution: data.resolution ?? "?",
-            rawTitle: data.rawTitle,
+            show: ep.show ?? "unknown",
+            episode: ep.episode,
+            provider: ep.provider ?? "unknown",
+            resolution: ep.resolution ?? "?",
+            rawTitle: ep.rawTitle,
           });
         }
       } catch {

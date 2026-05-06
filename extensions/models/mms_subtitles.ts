@@ -81,9 +81,9 @@ function pickStream(
 
   return (
     text.find((s) => langMatch(s) && isClean(s)) ??
-      text.find(langMatch) ??
-      text.find(isClean) ??
-      text[0]
+    text.find(langMatch) ??
+    text.find(isClean) ??
+    text[0]
   );
 }
 
@@ -114,6 +114,7 @@ export const model = {
           .default(false)
           .describe("Overwrite an existing .srt next to the source"),
       }),
+      // deno-lint-ignore no-explicit-any
       execute: async (
         args: { path: string; language: string; overwrite: boolean },
         // deno-lint-ignore no-explicit-any
@@ -178,9 +179,7 @@ export const model = {
         }
 
         context.logger.info(
-          `Extracting stream ${trackIndex} (${codec}, lang=${
-            lang ?? "?"
-          }) → ${output}`,
+          `Extracting stream ${trackIndex} (${codec}, lang=${lang ?? "?"}) → ${output}`,
         );
 
         const ffmpegArgs = [

@@ -1,9 +1,3 @@
-/**
- * `@keeb/mms/dedup-summary` report — summarize the output of a dedup filter
- * run: count of new episodes grouped by show.
- */
-
-/** Swamp report definition for `@keeb/mms/dedup-summary`. */
 export const report = {
   name: "@keeb/mms/dedup-summary",
   description: "Summarize dedup filter results: what's new vs what was skipped",
@@ -18,6 +12,8 @@ export const report = {
     const modelType = context.modelType;
     const modelId = context.definition.id;
 
+    // Dedup writes a single `episodes` resource whose attributes contain
+    // the full run's actionable episodes array.
     const newEpisodes: { show: string; episode: string; provider: string }[] =
       [];
     for (const handle of handles) {
@@ -29,12 +25,15 @@ export const report = {
       if (!content) continue;
       try {
         const data = JSON.parse(new TextDecoder().decode(content));
-        if (data.show && data.episode) {
-          newEpisodes.push({
-            show: data.show,
-            episode: data.episode,
-            provider: data.provider ?? "unknown",
-          });
+        // deno-lint-ignore no-explicit-any
+        for (const ep of (data.episodes ?? []) as any[]) {
+          if (ep.show && ep.episode) {
+            newEpisodes.push({
+              show: ep.show,
+              episode: ep.episode,
+              provider: ep.provider ?? "unknown",
+            });
+          }
         }
       } catch { /* skip */ }
     }
