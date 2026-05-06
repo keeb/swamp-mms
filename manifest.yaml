@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/mms"
-version: "2026.05.06.1"
+version: "2026.05.06.2"
 description: "Media management system — content discovery, deduplication, download protocol handling, LLM-powered file organization, and subtitle extraction"
 repository: https://github.com/keeb/swamp-mms
 platforms: []
@@ -21,9 +21,12 @@ models:
   - mms_dedup.ts
   - mms_organizer.ts
   - mms_subtitles.ts
+  - subsplease_schedule.ts
+  - tmdb_lookup.ts
 reports:
   - discovery_summary.ts
   - dedup_summary.ts
   - download_status.ts
+  - add_summary.ts
 skills:
   - mms
