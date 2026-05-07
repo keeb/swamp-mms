@@ -118,6 +118,9 @@ export const model = {
         const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
           `${context.repoDir}/prompts/filename-to-json.prompt`,
         );
+        const ANIME_FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
+          `${context.repoDir}/prompts/anime-filename-to-json.prompt`,
+        );
         const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
           `${context.repoDir}/prompts/json-to-save-path.prompt`,
         );
@@ -221,11 +224,18 @@ export const model = {
                     `Fast-path (deterministic): ${file.name} → ${destPath}`,
                   );
                 } else {
-                  // Stage 1: filename → JSON metadata
+                  // Stage 1: filename → JSON metadata.
+                  // If the release group is unambiguously anime, route to the
+                  // anime-specific prompt — the general prompt loses
+                  // season/episode on noisy anime filenames (alt titles,
+                  // year-in-parens) that the fast-path defers.
+                  const stage1Prompt = isAnimeByReleaseGroup(file.name)
+                    ? ANIME_FILENAME_TO_JSON_PROMPT
+                    : FILENAME_TO_JSON_PROMPT;
                   const metadataJson = await ollamaGenerate(
                     ollamaUrl,
                     ollamaModel,
-                    FILENAME_TO_JSON_PROMPT,
+                    stage1Prompt,
                     file.name,
                   );
 
@@ -357,11 +367,18 @@ export const model = {
       execute: async (args: { filename: string }, context: any) => {
         const { ollamaModel, ollamaUrl, mediaRoot } = context.globalArgs;
 
+        const isAnime = isAnimeByReleaseGroup(args.filename);
+        const stage1PromptName = isAnime
+          ? "anime-filename-to-json.prompt"
+          : "filename-to-json.prompt";
         const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/filename-to-json.prompt`,
+          `${context.repoDir}/prompts/${stage1PromptName}`,
         );
         const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
           `${context.repoDir}/prompts/json-to-save-path.prompt`,
+        );
+        context.logger.info(
+          `Stage 1 prompt: ${stage1PromptName}${isAnime ? " (anime release group)" : ""}`,
         );
 
         // Regex fast-path (same logic as mms_dedup)
@@ -565,6 +582,11 @@ const LLM_REMAP_TRIGGERS = [
 function getReleaseGroup(filename: string): string | null {
   const m = filename.match(/^\[([^\]]+)\]/);
   return m ? m[1].toLowerCase() : null;
+}
+
+function isAnimeByReleaseGroup(filename: string): boolean {
+  const group = getReleaseGroup(filename);
+  return group != null && ANIME_RELEASE_GROUPS.has(group);
 }
 
 // Mirrors the save-path prompt's naming rules: lowercase, spaces→hyphens,
