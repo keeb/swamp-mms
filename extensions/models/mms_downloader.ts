@@ -473,7 +473,8 @@ export const model = {
             };
             const status = statusMap[t.status] ?? "unknown";
             const idSuffix = `-${t.id}`;
-            const instanceName = slugify(t.name).slice(0, 80 - idSuffix.length) + idSuffix;
+            const instanceName =
+              slugify(t.name).slice(0, 80 - idSuffix.length) + idSuffix;
 
             const handle = await context.writeResource(
               "download",

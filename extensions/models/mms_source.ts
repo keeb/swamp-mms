@@ -614,7 +614,7 @@ export const model = {
       description:
         "All items from the most recent invocation. Single instance named " +
         "'current' that supersedes on each run — `data.latest(<model>, " +
-        "\"episodes\")` always returns this run's results and only this " +
+        '"episodes")` always returns this run\'s results and only this ' +
         "run's results.",
       schema: EpisodesSchema,
       lifetime: "infinite" as const,

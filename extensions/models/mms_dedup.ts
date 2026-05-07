@@ -192,7 +192,7 @@ export const model = {
         "Drop per-episode factory resources — dedup output is pipeline " +
         "output, not a set of durable entities. The aggregate resource " +
         "(renamed from `batch` → `episodes`) is the sole output. Downstream " +
-        "consumers now query `data.latest(\"dedup\", \"episodes\")`. Orphaned " +
+        'consumers now query `data.latest("dedup", "episodes")`. Orphaned ' +
         "`episode` and `batch` records from prior versions can be purged " +
         "with `swamp data gc`.",
       // deno-lint-ignore no-explicit-any
@@ -204,7 +204,7 @@ export const model = {
       description:
         "All actionable episodes from the most recent invocation. Single " +
         "instance named 'current' that supersedes on each run — " +
-        "`data.latest(\"dedup\", \"episodes\")` always returns this run's " +
+        '`data.latest("dedup", "episodes")` always returns this run\'s ' +
         "results and only this run's results.",
       schema: EpisodesSchema,
       lifetime: "infinite" as const,
@@ -290,7 +290,9 @@ export const model = {
               season = regexParsed.season;
               regexParsedCount++;
               context.logger.info(
-                `Regex: "${data.rawTitle.slice(0, 60)}" → ${show} s${season} ep ${episode}`,
+                `Regex: "${
+                  data.rawTitle.slice(0, 60)
+                }" → ${show} s${season} ep ${episode}`,
               );
             } else {
               // LLM for full extraction (show, season, episode)

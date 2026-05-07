@@ -368,7 +368,9 @@ export const model = {
         const regexResult = regexParseFilename(args.filename);
         if (regexResult) {
           context.logger.info(
-            `Regex parsed: show=${regexResult.show}, season=${regexResult.season ?? "none"}, episode=${regexResult.episode}`,
+            `Regex parsed: show=${regexResult.show}, season=${
+              regexResult.season ?? "none"
+            }, episode=${regexResult.episode}`,
           );
         } else {
           context.logger.info("Regex: no match, LLM required");

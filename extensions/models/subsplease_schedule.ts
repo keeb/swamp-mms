@@ -45,8 +45,9 @@ export const model = {
       }),
       // deno-lint-ignore no-explicit-any
       execute: async (args: any, context: any) => {
-        const url =
-          `https://subsplease.org/api/?f=schedule&tz=${encodeURIComponent(args.tz)}`;
+        const url = `https://subsplease.org/api/?f=schedule&tz=${
+          encodeURIComponent(args.tz)
+        }`;
         context.logger.info(`Fetching ${url}`);
 
         const res = await fetch(url);
@@ -59,7 +60,9 @@ export const model = {
         const json = await res.json();
         const schedule = json.schedule as Record<string, ScheduleEntry[]>;
         if (!schedule || typeof schedule !== "object") {
-          throw new Error("SubsPlease schedule response missing schedule field");
+          throw new Error(
+            "SubsPlease schedule response missing schedule field",
+          );
         }
 
         const handles = [];
