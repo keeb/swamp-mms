@@ -47,53 +47,6 @@ const EpisodesSchema = z.object({
   timestamp: z.string().describe("ISO timestamp when the run finished"),
 });
 
-// --- Regex title parser (fast path, avoids LLM) ---
-
-function regexParseTitle(
-  raw: string,
-): { show: string; episode: string; season?: string } | null {
-  // S01E06 / S1E6 / s01e06
-  const seMatch = raw.match(/^(.+?)[.\s_-]+[Ss](\d{1,2})[Ee](\d{1,3})\b/);
-  if (seMatch) {
-    return {
-      show: seMatch[1].replace(/\./g, " ").trim(),
-      season: String(parseInt(seMatch[2])),
-      episode: String(parseInt(seMatch[3])),
-    };
-  }
-
-  // 1x06 / 01x06
-  const xMatch = raw.match(/^(.+?)[.\s_-]+(\d{1,2})x(\d{1,3})\b/);
-  if (xMatch) {
-    return {
-      show: xMatch[1].replace(/\./g, " ").trim(),
-      season: String(parseInt(xMatch[2])),
-      episode: String(parseInt(xMatch[3])),
-    };
-  }
-
-  // Anime style: [Group] Title - 06 [1080p] or Title - 1106
-  // Handles: space-dash-space, space-dash-number, various digit lengths
-  const animeMatch = raw.match(/^(?:\[.*?\]\s*)?(.+?)\s+-\s*(\d{2,4})\b/);
-  if (animeMatch) {
-    return {
-      show: animeMatch[1].trim(),
-      episode: String(parseInt(animeMatch[2])),
-    };
-  }
-
-  // Bare: Title 1106 [quality] or Title.1106.stuff (no dash, common in Nyaa)
-  const bareMatch = raw.match(/^(?:\[.*?\]\s*)?(.+?)\s+(\d{3,4})\s*[\[\(\.]/);
-  if (bareMatch) {
-    return {
-      show: bareMatch[1].trim(),
-      episode: String(parseInt(bareMatch[2])),
-    };
-  }
-
-  return null;
-}
-
 // --- Filesystem helpers ---
 
 function normalize(s: string): string {
@@ -148,6 +101,44 @@ function fileExistsInIndex(
 
   for (const file of fileIndex) {
     if (file.normalized.includes(normalizedShow) && epPattern.test(file.name)) {
+      logger.info(`Found: ${file.path}`);
+      return true;
+    }
+  }
+  return false;
+}
+
+function fileExistsInDest(
+  destPath: string,
+  season: string | undefined,
+  episode: string,
+  fileIndex: { name: string; normalized: string; path: string }[],
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+): boolean {
+  // Match by show slug only — not full destPath. The LLM occasionally puts
+  // anime under /shows/ instead of /anime/completed/ (or omits/adds a /sN
+  // suffix), but the show slug is consistently correct. Anchoring on
+  // /<slug>/ as a path component decouples the disk check from which root
+  // dir the LLM picked, while the SxxExx episode pattern guards against
+  // cross-show false positives.
+  const showRoot = destPath.replace(/\/s\d+\/?$/, "").replace(/\/$/, "");
+  const slug = showRoot.substring(showRoot.lastIndexOf("/") + 1);
+  if (!slug) return false;
+  const slugMarker = `/${slug}/`;
+
+  const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
+  const seasonPadded = season
+    ? String(parseInt(season)).padStart(2, "0")
+    : null;
+  const sePattern = seasonPadded
+    ? new RegExp(`[Ss]${seasonPadded}[Ee]${epPadded}\\b`)
+    : null;
+  const epPattern = new RegExp(`[\\s\\-_\\.E]0?${epPadded}[\\s\\.\\[\\(v\\-]`);
+
+  for (const file of fileIndex) {
+    if (!file.path.includes(slugMarker)) continue;
+    if (sePattern?.test(file.name) || epPattern.test(file.name)) {
       logger.info(`Found: ${file.path}`);
       return true;
     }
@@ -224,9 +215,17 @@ export const model = {
       execute: async (args: { sourceModel: string }, context: any) => {
         const { checkDirs, ollamaUrl, ollamaModel } = context.globalArgs;
 
-        // Load prompt from canonical file
+        // Load prompts from canonical files. Same two-stage pipeline as
+        // mms_organizer: stage 1 normalizes the raw title into structured JSON,
+        // stage 2 turns that JSON into the canonical destPath the organizer
+        // would write to. Dedup checks disk against that destPath, so a
+        // skip/new decision is consistent with where the organizer would
+        // actually place the file.
         const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
           `${context.repoDir}/prompts/filename-to-json.prompt`,
+        );
+        const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
+          `${context.repoDir}/prompts/json-to-save-path.prompt`,
         );
 
         // Read the source model's latest run — a single aggregate record
@@ -268,7 +267,6 @@ export const model = {
         let checked = 0;
         let skipped = 0;
         let llmParsed = 0;
-        let regexParsedCount = 0;
 
         for (const item of items) {
           const data = item.attributes;
@@ -277,57 +275,57 @@ export const model = {
           let show = data.show;
           let episode = data.episode;
           let season = data.season;
+          let destPath: string | undefined;
           const isSubsPlease = data.provider === "subsplease";
 
-          // Nyaa items: always extract show/season/episode from rawTitle
-          // SubsPlease items: already have show+episode, skip parsing
+          // Nyaa items: always run the LLM pipeline (filename → JSON →
+          // destPath). Regex on raw release titles is whack-a-mole: every new
+          // release group invents a new prefix/alias/year/parenthetical
+          // convention. The LLM owns canonicalization in one place (the two
+          // prompts), inheriting any special cases already encoded there.
+          // SubsPlease items skip parsing because the source RSS already
+          // gives clean show+episode fields.
           if (!isSubsPlease && data.rawTitle) {
-            // Try regex first
-            const regexParsed = regexParseTitle(data.rawTitle);
-            if (regexParsed && regexParsed.season) {
-              show = regexParsed.show;
-              episode = regexParsed.episode;
-              season = regexParsed.season;
-              regexParsedCount++;
-              context.logger.info(
-                `Regex: "${
-                  data.rawTitle.slice(0, 60)
-                }" → ${show} s${season} ep ${episode}`,
+            try {
+              const jsonStr = await ollamaGenerate(
+                ollamaUrl,
+                ollamaModel,
+                FILENAME_TO_JSON_PROMPT,
+                data.rawTitle,
               );
-            } else {
-              // LLM for full extraction (show, season, episode)
-              try {
-                const jsonStr = await ollamaGenerate(
-                  ollamaUrl,
-                  ollamaModel,
-                  FILENAME_TO_JSON_PROMPT,
-                  data.rawTitle,
-                );
-                const parsed = JSON.parse(jsonStr);
-                if (parsed.title && parsed.episode != null) {
-                  show = parsed.title;
-                  episode = String(parsed.episode);
-                  season = parsed.season != null
-                    ? String(parsed.season)
-                    : undefined;
-                  llmParsed++;
-                  context.logger.info(
-                    `LLM: "${data.rawTitle.slice(0, 60)}" → ${show} s${
-                      season ?? "?"
-                    } ep ${episode}`,
-                  );
-                } else {
-                  context.logger.info(
-                    `LLM: incomplete parse for "${data.rawTitle.slice(0, 60)}"`,
-                  );
-                  continue;
-                }
-              } catch (err) {
+              const parsed = JSON.parse(jsonStr);
+              if (!parsed.title || parsed.episode == null) {
                 context.logger.info(
-                  `LLM: failed for "${data.rawTitle?.slice(0, 60)}": ${err}`,
+                  `LLM stage 1: incomplete parse for "${
+                    data.rawTitle.slice(0, 60)
+                  }" — jsonStr=[${jsonStr}] parsed=${JSON.stringify(parsed)}`,
                 );
                 continue;
               }
+              show = parsed.title;
+              episode = String(parsed.episode);
+              season = parsed.season != null
+                ? String(parsed.season)
+                : undefined;
+              destPath = (
+                await ollamaGenerate(
+                  ollamaUrl,
+                  ollamaModel,
+                  JSON_TO_SAVE_PATH_PROMPT,
+                  jsonStr,
+                )
+              ).trim();
+              llmParsed++;
+              context.logger.info(
+                `LLM: "${data.rawTitle.slice(0, 60)}" → ${show} s${
+                  season ?? "?"
+                } ep ${episode} @ ${destPath}`,
+              );
+            } catch (err) {
+              context.logger.info(
+                `LLM: failed for "${data.rawTitle?.slice(0, 60)}": ${err}`,
+              );
+              continue;
             }
           }
 
@@ -335,16 +333,19 @@ export const model = {
           checked++;
 
           let exists: boolean;
-          if (isSubsPlease) {
-            // Fast path: exact filename match in crawled index
-            exists = fileExistsInIndex(
-              show,
+          if (destPath) {
+            // Nyaa items: check disk under the canonical destPath the
+            // organizer would write to. Consistent with on-disk dir naming.
+            exists = fileExistsInDest(
+              destPath,
+              season,
               episode,
               fileIndex,
               context.logger,
             );
           } else {
-            // Structured path: {dir}/{show-slug}/s{season}/ for parsed Nyaa items
+            // SubsPlease items: trust source-provided show name; substring
+            // match against the file index.
             exists = fileExistsInIndex(
               show,
               episode,
@@ -412,7 +413,7 @@ export const model = {
         });
 
         context.logger.info(
-          `Checked ${checked}: ${finalEpisodes.length} new (${handles.length} before dedup), ${skipped} on disk, ${regexParsedCount} regex-parsed, ${llmParsed} LLM-parsed`,
+          `Checked ${checked}: ${finalEpisodes.length} new (${handles.length} before dedup), ${skipped} on disk, ${llmParsed} LLM-parsed`,
         );
         return { dataHandles: [handle] };
       },

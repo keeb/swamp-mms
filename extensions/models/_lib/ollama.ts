@@ -11,7 +11,7 @@ export async function ollamaGenerate(
       model,
       messages: [{ role: "user", content: `${prompt}\n\n${input}` }],
       stream: false,
-      options: { num_predict: 1024 },
+      options: { num_predict: 1024, temperature: 0 },
       think: false,
     }),
   });
