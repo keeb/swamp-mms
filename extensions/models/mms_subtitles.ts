@@ -89,7 +89,7 @@ function pickStream(
 
 export const model = {
   type: "@keeb/mms/subtitles",
-  version: "2026.04.27.1",
+  version: "2026.05.18.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     extraction: {
@@ -119,103 +119,178 @@ export const model = {
         // deno-lint-ignore no-explicit-any
         context: any,
       ) => {
-        const { path, language, overwrite } = args;
-
-        const stat = await Deno.stat(path);
-        if (!stat.isFile) {
-          throw new Error(`Not a file: ${path}`);
-        }
-        if (!path.toLowerCase().endsWith(".mkv")) {
-          throw new Error(`Expected .mkv, got: ${path}`);
-        }
-
-        const output = path.replace(/\.mkv$/i, ".srt");
-
-        // Idempotent: skip if .srt already exists unless overwriting
-        let exists = false;
-        try {
-          await Deno.stat(output);
-          exists = true;
-        } catch (err) {
-          if (!(err instanceof Deno.errors.NotFound)) throw err;
-        }
-
-        const streams = await probeSubtitles(path);
-        if (streams.length === 0) {
-          throw new Error(`No subtitle streams found in ${path}`);
-        }
-        const chosen = pickStream(streams, language);
-        if (!chosen) {
-          const codecs = [...new Set(streams.map((s) => s.codec_name))].join(
-            ", ",
-          );
-          throw new Error(
-            `No text subtitle stream in ${path} (found: ${codecs}). ` +
-              `Bitmap subs (PGS/VobSub/DVB) require OCR and aren't supported.`,
-          );
-        }
-
-        const trackIndex = chosen.index;
-        const codec = chosen.codec_name;
-        const lang = chosen.tags?.language;
-
-        if (exists && !overwrite) {
-          context.logger.info(`Skipping (exists): ${output}`);
-          const handle = await context.writeResource(
-            "extraction",
-            instanceName(path),
-            {
-              source: path,
-              output,
-              trackIndex,
-              language: lang,
-              codec,
-              status: "skipped" as const,
-              processedAt: new Date().toISOString(),
-            },
-          );
-          return { dataHandles: [handle] };
-        }
-
-        context.logger.info(
-          `Extracting stream ${trackIndex} (${codec}, lang=${
-            lang ?? "?"
-          }) → ${output}`,
-        );
-
-        const ffmpegArgs = [
-          "-y",
-          "-i",
-          path,
-          "-map",
-          `0:${trackIndex}`,
-          "-c:s",
-          "srt",
-          output,
-        ];
-        const { stderr, code } = await runCmd("ffmpeg", ffmpegArgs);
-        if (code !== 0) {
-          throw new Error(`ffmpeg failed (${code}): ${stderr}`);
-        }
-
-        const handle = await context.writeResource(
-          "extraction",
-          instanceName(path),
-          {
-            source: path,
-            output,
-            trackIndex,
-            language: lang,
-            codec,
-            status: "extracted" as const,
-            processedAt: new Date().toISOString(),
-          },
+        const handle = await extractOne(
+          args.path,
+          args.language,
+          args.overwrite,
+          context,
         );
         return { dataHandles: [handle] };
       },
     },
+    extract_recent: {
+      description:
+        "Batch-extract subtitles from MKVs produced by recent organizer jobs",
+      arguments: z.object({
+        windowMinutes: z
+          .number()
+          .default(60)
+          .describe(
+            "Look at organizer jobs processed in the last N minutes",
+          ),
+        language: z
+          .string()
+          .default("eng")
+          .describe("Preferred subtitle language tag (ISO 639-2)"),
+        overwrite: z
+          .boolean()
+          .default(false)
+          .describe("Overwrite an existing .srt next to the source"),
+      }),
+      execute: async (
+        args: {
+          windowMinutes: number;
+          language: string;
+          overwrite: boolean;
+        },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const cutoff = new Date(
+          Date.now() - args.windowMinutes * 60 * 1000,
+        ).toISOString();
+        const predicate = `modelName == "organizer" && specName == "job" && ` +
+          `attributes.status == "processed" && ` +
+          `attributes.processedAt > "${cutoff}"`;
+        const records = await context.queryData(predicate);
+        context.logger.info(
+          `Found ${records.length} organized job(s) since ${cutoff}`,
+        );
+
+        // deno-lint-ignore no-explicit-any
+        const handles: any[] = [];
+        const seen = new Set<string>();
+        for (const rec of records) {
+          // deno-lint-ignore no-explicit-any
+          const attrs = (rec as any).attributes ?? {};
+          const destPath: string | undefined = attrs.destPath;
+          const filename: string | undefined = attrs.filename;
+          if (!destPath || !filename) continue;
+          if (!filename.toLowerCase().endsWith(".mkv")) continue;
+          const fullPath = `${destPath.replace(/\/$/, "")}/${filename}`;
+          if (seen.has(fullPath)) continue;
+          seen.add(fullPath);
+
+          try {
+            const handle = await extractOne(
+              fullPath,
+              args.language,
+              args.overwrite,
+              context,
+            );
+            handles.push(handle);
+          } catch (err) {
+            // Per-file failures (no subs, bitmap-only, missing file after
+            // post-organize cleanup) shouldn't abort the batch.
+            context.logger.warn(`Skip ${fullPath}: ${err}`);
+          }
+        }
+        context.logger.info(
+          `Extracted/skipped ${handles.length} subtitle track(s)`,
+        );
+        return { dataHandles: handles };
+      },
+    },
   },
 };
+
+async function extractOne(
+  path: string,
+  language: string,
+  overwrite: boolean,
+  // deno-lint-ignore no-explicit-any
+  context: any,
+  // deno-lint-ignore no-explicit-any
+): Promise<any> {
+  const stat = await Deno.stat(path);
+  if (!stat.isFile) {
+    throw new Error(`Not a file: ${path}`);
+  }
+  if (!path.toLowerCase().endsWith(".mkv")) {
+    throw new Error(`Expected .mkv, got: ${path}`);
+  }
+
+  const output = path.replace(/\.mkv$/i, ".srt");
+
+  let exists = false;
+  try {
+    await Deno.stat(output);
+    exists = true;
+  } catch (err) {
+    if (!(err instanceof Deno.errors.NotFound)) throw err;
+  }
+
+  const streams = await probeSubtitles(path);
+  if (streams.length === 0) {
+    throw new Error(`No subtitle streams found in ${path}`);
+  }
+  const chosen = pickStream(streams, language);
+  if (!chosen) {
+    const codecs = [...new Set(streams.map((s) => s.codec_name))].join(", ");
+    throw new Error(
+      `No text subtitle stream in ${path} (found: ${codecs}). ` +
+        `Bitmap subs (PGS/VobSub/DVB) require OCR and aren't supported.`,
+    );
+  }
+
+  const trackIndex = chosen.index;
+  const codec = chosen.codec_name;
+  const lang = chosen.tags?.language;
+
+  if (exists && !overwrite) {
+    context.logger.info(`Skipping (exists): ${output}`);
+    return await context.writeResource("extraction", instanceName(path), {
+      source: path,
+      output,
+      trackIndex,
+      language: lang,
+      codec,
+      status: "skipped" as const,
+      processedAt: new Date().toISOString(),
+    });
+  }
+
+  context.logger.info(
+    `Extracting stream ${trackIndex} (${codec}, lang=${
+      lang ?? "?"
+    }) → ${output}`,
+  );
+
+  const ffmpegArgs = [
+    "-y",
+    "-i",
+    path,
+    "-map",
+    `0:${trackIndex}`,
+    "-c:s",
+    "srt",
+    output,
+  ];
+  const { stderr, code } = await runCmd("ffmpeg", ffmpegArgs);
+  if (code !== 0) {
+    throw new Error(`ffmpeg failed (${code}): ${stderr}`);
+  }
+
+  return await context.writeResource("extraction", instanceName(path), {
+    source: path,
+    output,
+    trackIndex,
+    language: lang,
+    codec,
+    status: "extracted" as const,
+    processedAt: new Date().toISOString(),
+  });
+}
 
 // Stable instance name keyed on the source path so re-extractions update the
 // same resource rather than creating new instances per run.

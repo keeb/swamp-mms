@@ -25,6 +25,30 @@ const TvShowSchema = z.object({
   url: z.string().optional(),
 });
 
+const MovieSchema = z.object({
+  tmdbId: z.number(),
+  title: z.string(),
+  originalTitle: z.string().optional(),
+  overview: z.string().nullable().optional(),
+  status: z.string().optional(),
+  releaseDate: z.string().nullable().optional(),
+  runtime: z.number().nullable().optional(),
+  budget: z.number().nullable().optional(),
+  revenue: z.number().nullable().optional(),
+  voteAverage: z.number().nullable().optional(),
+  voteCount: z.number().nullable().optional(),
+  popularity: z.number().nullable().optional(),
+  tagline: z.string().nullable().optional(),
+  genres: z.array(z.string()).optional(),
+  productionCompanies: z.array(z.string()).optional(),
+  productionCountries: z.array(z.string()).optional(),
+  spokenLanguages: z.array(z.string()).optional(),
+  originalLanguage: z.string().optional(),
+  homepage: z.string().nullable().optional(),
+  imdbId: z.string().nullable().optional(),
+  url: z.string().optional(),
+});
+
 const BASE = "https://api.themoviedb.org/3";
 
 async function tmdbFetch(
@@ -56,12 +80,26 @@ function slugify(s: string): string {
 
 export const model = {
   type: "@keeb/tmdb-lookup",
-  version: "2026.03.31.1",
+  version: "2026.05.14.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.05.14.1",
+      description:
+        "Add searchMovie method and movie resource; no globalArgs change",
+      upgradeAttributes: (old) => old,
+    },
+  ],
   resources: {
     show: {
       description: "TV show info from TMDB",
       schema: TvShowSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    movie: {
+      description: "Movie info from TMDB",
+      schema: MovieSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,
     },
@@ -114,6 +152,76 @@ export const model = {
               networks: (details.networks || []).map((n: any) => n.name),
               originCountry: details.origin_country || undefined,
               url: `https://www.themoviedb.org/tv/${details.id}`,
+            },
+          );
+          handles.push(handle);
+        }
+
+        return { dataHandles: handles };
+      },
+    },
+    searchMovie: {
+      description:
+        "Search TMDB for a movie by title, fetches full details (release date, runtime, vote, etc.)",
+      arguments: z.object({
+        query: z.string().describe("Movie title to search for"),
+        year: z.number().optional().describe(
+          "Optional release-year hint to disambiguate",
+        ),
+        limit: z.number().default(5).describe("Max results to return"),
+      }),
+      execute: async (args, context) => {
+        const { apiKey } = context.globalArgs;
+        const { logger } = context;
+
+        const params: Record<string, string> = { query: args.query };
+        if (args.year) params.year = String(args.year);
+        const searchData = await tmdbFetch("/search/movie", apiKey, params);
+
+        const results = (searchData.results || []).slice(0, args.limit);
+        logger.info(
+          `Found ${results.length} movie results for "${args.query}"`,
+        );
+
+        const handles = [];
+        for (const result of results) {
+          const details = await tmdbFetch(`/movie/${result.id}`, apiKey);
+
+          const handle = await context.writeResource(
+            "movie",
+            slugify(details.title || result.title),
+            {
+              tmdbId: details.id,
+              title: details.title,
+              originalTitle: details.original_title || undefined,
+              overview: details.overview || null,
+              status: details.status || undefined,
+              releaseDate: details.release_date || null,
+              runtime: details.runtime ?? null,
+              budget: details.budget ?? null,
+              revenue: details.revenue ?? null,
+              voteAverage: details.vote_average ?? null,
+              voteCount: details.vote_count ?? null,
+              popularity: details.popularity ?? null,
+              tagline: details.tagline || null,
+              // deno-lint-ignore no-explicit-any
+              genres: (details.genres || []).map((g: any) => g.name),
+              productionCompanies: (details.production_companies || []).map(
+                // deno-lint-ignore no-explicit-any
+                (c: any) => c.name,
+              ),
+              productionCountries: (details.production_countries || []).map(
+                // deno-lint-ignore no-explicit-any
+                (c: any) => c.name,
+              ),
+              spokenLanguages: (details.spoken_languages || []).map(
+                // deno-lint-ignore no-explicit-any
+                (l: any) => l.english_name || l.name,
+              ),
+              originalLanguage: details.original_language || undefined,
+              homepage: details.homepage || null,
+              imdbId: details.imdb_id || null,
+              url: `https://www.themoviedb.org/movie/${details.id}`,
             },
           );
           handles.push(handle);

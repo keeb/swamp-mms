@@ -116,16 +116,19 @@ function fileExistsInDest(
   // deno-lint-ignore no-explicit-any
   logger: any,
 ): boolean {
-  // Match by show slug only — not full destPath. The LLM occasionally puts
-  // anime under /shows/ instead of /anime/completed/ (or omits/adds a /sN
-  // suffix), but the show slug is consistently correct. Anchoring on
-  // /<slug>/ as a path component decouples the disk check from which root
-  // dir the LLM picked, while the SxxExx episode pattern guards against
-  // cross-show false positives.
+  // Match by show slug. Accept the file via either of two anchors:
+  //   1. path contains /<slug>/ — the canonical organized location.
+  //   2. normalized filename contains normalize(slug) — catches files
+  //      sitting in flat dirs (e.g. staging/) before the organizer has
+  //      moved them under their slug directory.
+  // The SxxExx episode pattern then guards against cross-show false
+  // positives. Without the filename fallback, anything in staging is
+  // invisible to dedup and gets re-downloaded on the next discover cycle.
   const showRoot = destPath.replace(/\/s\d+\/?$/, "").replace(/\/$/, "");
   const slug = showRoot.substring(showRoot.lastIndexOf("/") + 1);
   if (!slug) return false;
   const slugMarker = `/${slug}/`;
+  const normalizedSlug = normalize(slug);
 
   const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
   const seasonPadded = season
@@ -137,7 +140,9 @@ function fileExistsInDest(
   const epPattern = new RegExp(`[\\s\\-_\\.E]0?${epPadded}[\\s\\.\\[\\(v\\-]`);
 
   for (const file of fileIndex) {
-    if (!file.path.includes(slugMarker)) continue;
+    const dirAnchor = file.path.includes(slugMarker);
+    const nameAnchor = file.normalized.includes(normalizedSlug);
+    if (!dirAnchor && !nameAnchor) continue;
     if (sePattern?.test(file.name) || epPattern.test(file.name)) {
       logger.info(`Found: ${file.path}`);
       return true;
@@ -150,7 +155,7 @@ function fileExistsInDest(
 
 export const model = {
   type: "@keeb/mms/dedup",
-  version: "2026.04.14.1",
+  version: "2026.05.08.1",
   reports: ["@keeb/mms/dedup-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -186,6 +191,18 @@ export const model = {
         'consumers now query `data.latest("dedup", "episodes")`. Orphaned ' +
         "`episode` and `batch` records from prior versions can be purged " +
         "with `swamp data gc`.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.04.14.1",
+      toVersion: "2026.05.08.1",
+      description:
+        "Honor optional `slug` on input episodes (added in @keeb/mms/source " +
+        "2026.05.08.1). When present, override the LLM-parsed title with " +
+        "the slug and synthesize destPath instead of running LLM stage 2. " +
+        "Fixes mismatch where the torrent's display title and the catalog " +
+        "directory diverge (e.g. Judas releases).",
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
@@ -307,20 +324,38 @@ export const model = {
               season = parsed.season != null
                 ? String(parsed.season)
                 : undefined;
-              destPath = (
-                await ollamaGenerate(
-                  ollamaUrl,
-                  ollamaModel,
-                  JSON_TO_SAVE_PATH_PROMPT,
-                  jsonStr,
-                )
-              ).trim();
-              llmParsed++;
-              context.logger.info(
-                `LLM: "${data.rawTitle.slice(0, 60)}" → ${show} s${
-                  season ?? "?"
-                } ep ${episode} @ ${destPath}`,
-              );
+              if (data.slug) {
+                // Config supplied a canonical slug — skip LLM stage 2 and
+                // synthesize destPath directly. fileExistsInDest only uses
+                // the trailing /<slug>/sN component, so the prefix is
+                // immaterial. Keeps dedup matching anchored on the same
+                // slug the catalog actually uses.
+                show = data.slug;
+                destPath = season
+                  ? `/${data.slug}/s${parseInt(season)}`
+                  : `/${data.slug}`;
+                llmParsed++;
+                context.logger.info(
+                  `LLM+slug: "${data.rawTitle.slice(0, 60)}" → ${data.slug} s${
+                    season ?? "?"
+                  } ep ${episode} @ ${destPath}`,
+                );
+              } else {
+                destPath = (
+                  await ollamaGenerate(
+                    ollamaUrl,
+                    ollamaModel,
+                    JSON_TO_SAVE_PATH_PROMPT,
+                    jsonStr,
+                  )
+                ).trim();
+                llmParsed++;
+                context.logger.info(
+                  `LLM: "${data.rawTitle.slice(0, 60)}" → ${show} s${
+                    season ?? "?"
+                  } ep ${episode} @ ${destPath}`,
+                );
+              }
             } catch (err) {
               context.logger.info(
                 `LLM: failed for "${data.rawTitle?.slice(0, 60)}": ${err}`,

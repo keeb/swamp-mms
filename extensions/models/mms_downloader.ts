@@ -112,7 +112,7 @@ const AddBatchSchema = z.object({
 
 export const model = {
   type: "@keeb/mms/downloader",
-  version: "2026.04.21.1",
+  version: "2026.05.10.1",
   upgrades: [
     {
       fromVersion: "2026.03.28.1",
@@ -147,6 +147,15 @@ export const model = {
         "resource per invocation instead of one download record per " +
         "episode. Per-torrent tracking is owned exclusively by the status " +
         "method. Eliminates the factory-per-episode orphan-data pattern.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      fromVersion: "2026.04.21.1",
+      toVersion: "2026.05.10.1",
+      description: "Add add_nzb_url method — fetches an arbitrary NZB URL " +
+        "(auth baked into the URL) and uploads the body to sab via " +
+        "mode=addfile. Surfaces fetch errors directly instead of " +
+        "delegating to sab's opaque addurl path.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -273,6 +282,168 @@ export const model = {
 
         const handle = await context.writeResource("add_batch", "current", {
           source: "add",
+          added,
+          failed,
+          count: added.length + failed.length,
+          timestamp: now,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    add_nzb_url: {
+      description:
+        "Construct an NZB URL from a vault-resolved template + a hash " +
+        "looked up in upstream source episodes data, fetch the body, and " +
+        "upload to sab via mode=addfile. The template's auth is supplied " +
+        "via the method's YAML defaults (vault expressions), so the real " +
+        "secret never leaves the method's argument frame — upstream " +
+        "data redaction blocks reading auth-baked URLs directly.",
+      arguments: z.object({
+        sourceModel: z
+          .string()
+          .describe(
+            "Upstream source model name whose `episodes` resource holds " +
+              "the hash (e.g. 'althub')",
+          ),
+        rawTitle: z
+          .string()
+          .describe(
+            "Exact rawTitle of the episode to fetch from the upstream " +
+              "source's episodes resource",
+          ),
+        indexerBaseUrl: z
+          .string()
+          .describe(
+            "Indexer base URL (no trailing slash), e.g. 'https://api.althub.co.za'",
+          ),
+        indexerApiKey: z
+          .string()
+          .meta({ sensitive: true })
+          .describe("Indexer API key (the `r` parameter)"),
+        indexerUserId: z
+          .string()
+          .describe("Indexer user id (the `i` parameter), e.g. '92563'"),
+        category: z
+          .string()
+          .optional()
+          .describe("Sab category to assign the download to"),
+        name: z
+          .string()
+          .optional()
+          .describe(
+            "Override the filename uploaded to sab. Defaults to rawTitle.nzb.",
+          ),
+      }),
+      execute: async (
+        args: {
+          sourceModel: string;
+          rawTitle: string;
+          indexerBaseUrl: string;
+          indexerApiKey: string;
+          indexerUserId: string;
+          category?: string;
+          name?: string;
+        },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const { sabnzbdUrl, sabnzbdApiKey } = context.globalArgs;
+        if (!sabnzbdUrl || !sabnzbdApiKey) {
+          throw new Error("sabnzbdUrl and sabnzbdApiKey are required");
+        }
+        const now = new Date().toISOString();
+        // deno-lint-ignore no-explicit-any
+        const added: any[] = [];
+        // deno-lint-ignore no-explicit-any
+        const failed: any[] = [];
+
+        const records = await context.queryData(
+          `modelName == "${args.sourceModel}" && specName == "episodes" && has(attributes.episodes)`,
+        );
+        if (records.length === 0) {
+          throw new Error(
+            `No episodes resource found for "${args.sourceModel}"`,
+          );
+        }
+        // deno-lint-ignore no-explicit-any
+        const episodes: any[] = records[0].attributes.episodes ?? [];
+        // deno-lint-ignore no-explicit-any
+        const ep = episodes.find((e: any) => e.rawTitle === args.rawTitle);
+        if (!ep || !ep.infoHash) {
+          throw new Error(
+            `rawTitle "${args.rawTitle}" not found in ${args.sourceModel} episodes (or missing infoHash)`,
+          );
+        }
+        const uri =
+          `${args.indexerBaseUrl}/getnzb/${ep.infoHash}.nzb&i=${args.indexerUserId}&r=${args.indexerApiKey}`;
+
+        try {
+          const nzbResp = await fetch(uri);
+          if (!nzbResp.ok) {
+            throw new Error(
+              `NZB fetch failed (${nzbResp.status}): ${await nzbResp.text()}`,
+            );
+          }
+          const nzbBytes = new Uint8Array(await nzbResp.arrayBuffer());
+
+          let filename = args.name;
+          if (!filename) {
+            const cd = nzbResp.headers.get("content-disposition") ?? "";
+            const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+            if (m) {
+              filename = decodeURIComponent(m[1]);
+            } else {
+              filename = `${args.rawTitle}.nzb`;
+            }
+          }
+
+          const fd = new FormData();
+          fd.set("mode", "addfile");
+          fd.set("apikey", sabnzbdApiKey);
+          fd.set("output", "json");
+          if (args.category) fd.set("cat", args.category);
+          fd.set(
+            "name",
+            new File([nzbBytes], filename, { type: "application/x-nzb" }),
+          );
+
+          const resp = await fetch(`${sabnzbdUrl}/api`, {
+            method: "POST",
+            body: fd,
+          });
+          if (!resp.ok) {
+            throw new Error(
+              `sab addfile failed (${resp.status}): ${await resp.text()}`,
+            );
+          }
+          // deno-lint-ignore no-explicit-any
+          const json: any = await resp.json();
+          if (json.status === false) {
+            throw new Error(`sab addfile rejected: ${JSON.stringify(json)}`);
+          }
+          const nzoId = json.nzo_ids?.[0] ?? "unknown";
+          added.push({
+            id: nzoId,
+            name: filename,
+            uri,
+            protocol: "usenet" as const,
+            backend: "sabnzbd",
+          });
+          context.logger.info(
+            `add_nzb_url: ${filename} -> ${nzoId} (${nzbBytes.length} bytes)`,
+          );
+        } catch (err) {
+          failed.push({
+            uri,
+            show: ep.show,
+            reason: String(err),
+          });
+          context.logger.error(`add_nzb_url failed: ${err}`);
+        }
+
+        const handle = await context.writeResource("add_batch", "current", {
+          source: "add_nzb_url",
           added,
           failed,
           count: added.length + failed.length,

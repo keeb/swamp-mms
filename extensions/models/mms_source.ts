@@ -1,10 +1,20 @@
 import { z } from "npm:zod@4";
-import { XMLParser } from "npm:fast-xml-parser@4.5.1";
+import { XMLParser } from "npm:fast-xml-parser@5.8.0";
 
 // --- Schemas ---
 
 const ShowConfigSchema = z.object({
   name: z.string().describe("Show name to search for"),
+  slug: z
+    .string()
+    .optional()
+    .describe(
+      "Canonical catalog slug. Set when the on-disk dir name diverges " +
+        "from a slugified search title (e.g. Judas releases the long " +
+        "Japanese title in torrent metadata but the catalog uses a short " +
+        "fan-tag like 'lastame'). Threads through to dedup so disk-checks " +
+        "anchor on this slug instead of the LLM-parsed title.",
+    ),
   provider: z
     .enum(["subsplease", "nyaa", "eztv", "newznab"])
     .describe("Content source provider"),
@@ -62,6 +72,9 @@ const GlobalArgsSchema = z.object({
 const EpisodeSchema = z.object({
   show: z.string().describe(
     "Show name (from search query for subsplease, raw for nyaa)",
+  ),
+  slug: z.string().optional().describe(
+    "Canonical catalog slug from ShowConfig (overrides parsed title in dedup)",
   ),
   episode: z.string().optional().describe(
     "Episode number (extracted for subsplease, absent for nyaa)",
@@ -513,7 +526,7 @@ async function searchNewznab(
 
 export const model = {
   type: "@keeb/mms/source",
-  version: "2026.05.04.1",
+  version: "2026.05.08.1",
   reports: ["@keeb/mms/discovery-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -605,6 +618,18 @@ export const model = {
       description:
         "Make Newznab search endpoint configurable (newznabSearchType: " +
         "tvsearch | search | movie). Default remains tvsearch.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.05.04.1",
+      toVersion: "2026.05.08.1",
+      description:
+        "Add optional `slug` to ShowConfig. When set, threads through into " +
+        "each episode so dedup can anchor disk-checks on the canonical " +
+        "catalog slug instead of an LLM-parsed title (needed for release " +
+        "groups like Judas where the torrent's display title and the file " +
+        "tag diverge).",
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
@@ -782,6 +807,10 @@ export const model = {
               );
             } else {
               continue;
+            }
+
+            if (show.slug) {
+              items = items.map((it) => ({ ...it, slug: show.slug }));
             }
 
             allItems.push(...items);

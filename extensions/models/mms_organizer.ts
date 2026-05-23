@@ -378,7 +378,9 @@ export const model = {
           `${context.repoDir}/prompts/json-to-save-path.prompt`,
         );
         context.logger.info(
-          `Stage 1 prompt: ${stage1PromptName}${isAnime ? " (anime release group)" : ""}`,
+          `Stage 1 prompt: ${stage1PromptName}${
+            isAnime ? " (anime release group)" : ""
+          }`,
         );
 
         // Regex fast-path (same logic as mms_dedup)
@@ -566,7 +568,13 @@ const ANIME_RELEASE_GROUPS = new Set([
   "judas",
   "ember",
   "asw",
+  "toonshub",
 ]);
+
+const ANIME_RELEASE_GROUP_RE = new RegExp(
+  `\\b(${[...ANIME_RELEASE_GROUPS].join("|")})\\b`,
+  "i",
+);
 
 // Patterns that require LLM-driven title remapping or complex season
 // extraction that plain regex can't do. Fall through to the LLM when any
@@ -580,13 +588,12 @@ const LLM_REMAP_TRIGGERS = [
 ];
 
 function getReleaseGroup(filename: string): string | null {
-  const m = filename.match(/^\[([^\]]+)\]/);
+  const m = filename.match(ANIME_RELEASE_GROUP_RE);
   return m ? m[1].toLowerCase() : null;
 }
 
 function isAnimeByReleaseGroup(filename: string): boolean {
-  const group = getReleaseGroup(filename);
-  return group != null && ANIME_RELEASE_GROUPS.has(group);
+  return getReleaseGroup(filename) != null;
 }
 
 // Mirrors the save-path prompt's naming rules: lowercase, spaces→hyphens,
@@ -620,8 +627,7 @@ function fastPathAnime(
   episode: number;
   destPath: string;
 } | null {
-  const group = getReleaseGroup(filename);
-  if (!group || !ANIME_RELEASE_GROUPS.has(group)) return null;
+  if (!isAnimeByReleaseGroup(filename)) return null;
 
   // Year-in-parens → likely a movie/film release, defer to LLM.
   if (/\(\d{4}\)/.test(filename)) return null;
