@@ -12,6 +12,29 @@ const ExtractionSchema = z.object({
   processedAt: z.iso.datetime(),
 });
 
+type Extraction = z.infer<typeof ExtractionSchema>;
+
+// One resource per extract_recent run instead of one per .srt. Keyed on a
+// stable instance name so each batch versions the same resource — the version
+// history is the run history.
+const RunSchema = z.object({
+  cutoff: z.iso.datetime().describe("Lower bound of the organizer-job window"),
+  windowMinutes: z.number().describe("Window size used for this run"),
+  jobs: z.number().describe("Organized jobs considered"),
+  extracted: z.number().describe("Tracks newly extracted to .srt"),
+  skipped: z.number().describe(
+    "Files skipped (existing .srt, overwrite=false)",
+  ),
+  failed: z.number().describe(
+    "Files that errored (no subs, bitmap-only, etc.)",
+  ),
+  results: z.array(ExtractionSchema).describe("Per-file extraction results"),
+  failures: z
+    .array(z.object({ source: z.string(), error: z.string() }))
+    .describe("Per-file failures, captured rather than aborting the batch"),
+  ranAt: z.iso.datetime(),
+});
+
 interface SubtitleStream {
   index: number;
   codec_name: string;
@@ -89,12 +112,21 @@ function pickStream(
 
 export const model = {
   type: "@keeb/mms/subtitles",
-  version: "2026.05.18.1",
+  version: "2026.07.03.1",
   globalArguments: GlobalArgsSchema,
   resources: {
+    // Single-file `extract` writes one of these (deliberate, manual). The batch
+    // `extract_recent` does NOT — it rolls every file into one `run` resource
+    // instead of spamming one per .srt.
     extraction: {
-      description: "Subtitle extraction result",
+      description: "Subtitle extraction result (single-file extract)",
       schema: ExtractionSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    run: {
+      description: "Batch subtitle-extraction run summary",
+      schema: RunSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,
     },
@@ -119,11 +151,16 @@ export const model = {
         // deno-lint-ignore no-explicit-any
         context: any,
       ) => {
-        const handle = await extractOne(
+        const result = await extractOne(
           args.path,
           args.language,
           args.overwrite,
           context,
+        );
+        const handle = await context.writeResource(
+          "extraction",
+          instanceName(result.source),
+          result,
         );
         return { dataHandles: [handle] };
       },
@@ -167,8 +204,8 @@ export const model = {
           `Found ${records.length} organized job(s) since ${cutoff}`,
         );
 
-        // deno-lint-ignore no-explicit-any
-        const handles: any[] = [];
+        const results: Extraction[] = [];
+        const failures: { source: string; error: string }[] = [];
         const seen = new Set<string>();
         for (const rec of records) {
           // deno-lint-ignore no-explicit-any
@@ -182,23 +219,41 @@ export const model = {
           seen.add(fullPath);
 
           try {
-            const handle = await extractOne(
+            const result = await extractOne(
               fullPath,
               args.language,
               args.overwrite,
               context,
             );
-            handles.push(handle);
+            results.push(result);
           } catch (err) {
             // Per-file failures (no subs, bitmap-only, missing file after
             // post-organize cleanup) shouldn't abort the batch.
             context.logger.warn(`Skip ${fullPath}: ${err}`);
+            failures.push({ source: fullPath, error: String(err) });
           }
         }
+        const extracted =
+          results.filter((r) => r.status === "extracted").length;
+        const skipped = results.filter((r) => r.status === "skipped").length;
         context.logger.info(
-          `Extracted/skipped ${handles.length} subtitle track(s)`,
+          `Run: ${extracted} extracted, ${skipped} skipped, ` +
+            `${failures.length} failed across ${records.length} job(s)`,
         );
-        return { dataHandles: handles };
+
+        // One rollup resource per run, not one per .srt.
+        const handle = await context.writeResource("run", "extract-recent", {
+          cutoff,
+          windowMinutes: args.windowMinutes,
+          jobs: records.length,
+          extracted,
+          skipped,
+          failed: failures.length,
+          results,
+          failures,
+          ranAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
       },
     },
   },
@@ -249,7 +304,7 @@ async function extractOne(
 
   if (exists && !overwrite) {
     context.logger.info(`Skipping (exists): ${output}`);
-    return await context.writeResource("extraction", instanceName(path), {
+    return {
       source: path,
       output,
       trackIndex,
@@ -257,7 +312,7 @@ async function extractOne(
       codec,
       status: "skipped" as const,
       processedAt: new Date().toISOString(),
-    });
+    };
   }
 
   context.logger.info(
@@ -281,7 +336,7 @@ async function extractOne(
     throw new Error(`ffmpeg failed (${code}): ${stderr}`);
   }
 
-  return await context.writeResource("extraction", instanceName(path), {
+  return {
     source: path,
     output,
     trackIndex,
@@ -289,7 +344,7 @@ async function extractOne(
     codec,
     status: "extracted" as const,
     processedAt: new Date().toISOString(),
-  });
+  };
 }
 
 // Stable instance name keyed on the source path so re-extractions update the

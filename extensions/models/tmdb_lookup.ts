@@ -80,7 +80,7 @@ function slugify(s: string): string {
 
 export const model = {
   type: "@keeb/tmdb-lookup",
-  version: "2026.05.14.1",
+  version: "2026.07.03.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
@@ -158,6 +158,29 @@ export const model = {
         }
 
         return { dataHandles: handles };
+      },
+    },
+    seasons: {
+      description:
+        "List a TV show's seasons with cumulative absolute episode ranges — for computing episode→season breaks",
+      arguments: z.object({
+        tmdbId: z.number().describe("TMDB TV id"),
+      }),
+      execute: async (args, context) => {
+        const { apiKey } = context.globalArgs;
+        const details = await tmdbFetch(`/tv/${args.tmdbId}`, apiKey);
+        context.logger.info(`Show: ${details.name} (id ${details.id})`);
+        let cum = 0;
+        // deno-lint-ignore no-explicit-any
+        for (const s of (details.seasons || []) as any[]) {
+          if (s.season_number === 0) continue; // specials
+          const start = cum + 1;
+          cum += s.episode_count;
+          context.logger.info(
+            `s${s.season_number}\t${start}-${cum}\t(${s.episode_count})\t${s.name}`,
+          );
+        }
+        return { dataHandles: [] };
       },
     },
     searchMovie: {

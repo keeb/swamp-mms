@@ -83,7 +83,7 @@ const JobSchema = z.object({
 
 export const model = {
   type: "@keeb/mms/organizer",
-  version: "2026.04.24.1",
+  version: "2026.07.03.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     job: {
@@ -210,8 +210,24 @@ export const model = {
                 let metadata: any;
                 let destPath: string;
 
+                // ──────────────────────────────────────────────────────────
+                // SPECIAL CASE: One Piece is foldered by TMDB season number
+                // (one-piece/sN) so Jellyfin pulls the right arc name + art.
+                // New episodes are the current arc — Elbaph = s23 (eps 1156+).
+                // Bump this when episodes pass the end of s23 (TMDB ep 1181).
+                // ──────────────────────────────────────────────────────────
                 const fast = fastPathAnime(file.name, mediaRoot);
-                if (fast) {
+                if (/one piece - \d/i.test(file.name)) {
+                  metadata = {
+                    media_type: "anime",
+                    title: "One Piece",
+                    season: null,
+                    episode: null,
+                    confidence: "High",
+                  };
+                  destPath = `${mediaRoot}/video/anime/completed/one-piece/s23`;
+                  context.logger.info(`One Piece special-case → ${destPath}`);
+                } else if (fast) {
                   metadata = {
                     media_type: "anime",
                     title: fast.title,
@@ -393,6 +409,30 @@ export const model = {
           );
         } else {
           context.logger.info("Regex: no match, LLM required");
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        // SPECIAL CASE: One Piece → current arc folder s23 (see process()).
+        // ────────────────────────────────────────────────────────────────────
+        if (/one piece - \d/i.test(args.filename)) {
+          const destPath = `${mediaRoot}/video/anime/completed/one-piece/s23`;
+          context.logger.info(`One Piece special-case → ${destPath}`);
+          const handle = await context.writeResource(
+            "job",
+            `test-${Date.now()}`,
+            {
+              jobId: "dry-run",
+              filename: args.filename,
+              mediaType: "anime",
+              title: "One Piece",
+              sourcePath: "(dry-run)",
+              destPath,
+              status: "processed" as const,
+              confidence: "High",
+              processedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
         }
 
         // Deterministic fast-path — mirrors production behavior

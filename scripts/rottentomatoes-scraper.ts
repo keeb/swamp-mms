@@ -14,6 +14,7 @@
 // consult NODE_PATH, which would break when this script ships inside the
 // extension bundle rather than alongside a node_modules tree.
 import { createRequire } from "node:module";
+import process from "node:process";
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright");
 // deno-lint-ignore no-explicit-any
