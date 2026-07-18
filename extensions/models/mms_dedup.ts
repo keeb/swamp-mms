@@ -19,7 +19,7 @@ const GlobalArgsSchema = z.object({
     .describe("Ollama model for title parsing"),
 });
 
-const EpisodeSchema = z.object({
+export const EpisodeSchema = z.object({
   show: z.string().describe("Show name"),
   episode: z.string().describe("Episode number"),
   season: z.string().optional().describe("Season number"),
@@ -49,11 +49,18 @@ const EpisodesSchema = z.object({
 
 // --- Filesystem helpers ---
 
-function normalize(s: string): string {
+export function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function slugDir(s: string): string {
+// Episode strings come from RSS titles and LLM output — schema-valid values
+// can contain regex metacharacters, which would blow up the interpolated
+// patterns below (e.g. episode "(" → "Unterminated group").
+export function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function slugDir(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
@@ -88,7 +95,7 @@ async function buildFileIndex(
   return files;
 }
 
-function fileExistsInIndex(
+export function fileExistsInIndex(
   show: string,
   episode: string,
   fileIndex: { name: string; normalized: string; path: string }[],
@@ -97,7 +104,9 @@ function fileExistsInIndex(
 ): boolean {
   const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
   const normalizedShow = normalize(show);
-  const epPattern = new RegExp(`[\\s\\-_\\.E]0?${epPadded}[\\s\\.\\[\\(v\\-]`);
+  const epPattern = new RegExp(
+    `[\\s\\-_\\.E]0?${escapeRegex(epPadded)}[\\s\\.\\[\\(v\\-]`,
+  );
 
   for (const file of fileIndex) {
     if (file.normalized.includes(normalizedShow) && epPattern.test(file.name)) {
@@ -108,7 +117,7 @@ function fileExistsInIndex(
   return false;
 }
 
-function fileExistsInDest(
+export function fileExistsInDest(
   destPath: string,
   season: string | undefined,
   episode: string,
@@ -135,9 +144,11 @@ function fileExistsInDest(
     ? String(parseInt(season)).padStart(2, "0")
     : null;
   const sePattern = seasonPadded
-    ? new RegExp(`[Ss]${seasonPadded}[Ee]${epPadded}\\b`)
+    ? new RegExp(`[Ss]${seasonPadded}[Ee]${escapeRegex(epPadded)}\\b`)
     : null;
-  const epPattern = new RegExp(`[\\s\\-_\\.E]0?${epPadded}[\\s\\.\\[\\(v\\-]`);
+  const epPattern = new RegExp(
+    `[\\s\\-_\\.E]0?${escapeRegex(epPadded)}[\\s\\.\\[\\(v\\-]`,
+  );
 
   for (const file of fileIndex) {
     const dirAnchor = file.path.includes(slugMarker);
@@ -149,6 +160,29 @@ function fileExistsInDest(
     }
   }
   return false;
+}
+
+// Keep one candidate per show+season+episode. Preference order:
+// MeGusta > HEVC/x265 > first seen.
+export function pickPreferred<
+  T extends { _show: string; _season?: string; _episode: string; _rawTitle?: string },
+>(handles: T[]): T[] {
+  const releaseScore = (title: string) =>
+    (title.includes("MeGusta") ? 10 : 0) +
+    (title.includes("HEVC") || title.includes("x265") ? 5 : 0);
+
+  const byEpisode = new Map<string, T>();
+  for (const h of handles) {
+    const key = slugDir(`${h._show}-s${h._season ?? "0"}-e${h._episode}`);
+    const existing = byEpisode.get(key);
+    if (
+      !existing ||
+      releaseScore(h._rawTitle ?? "") > releaseScore(existing._rawTitle ?? "")
+    ) {
+      byEpisode.set(key, h);
+    }
+  }
+  return [...byEpisode.values()];
 }
 
 // --- Model ---
@@ -418,28 +452,7 @@ export const model = {
         }
 
         // Deduplicate new episodes — keep one per show+season+episode (prefer HEVC/MeGusta)
-        // deno-lint-ignore no-explicit-any
-        const byEpisode = new Map<string, any>();
-        for (const h of handles) {
-          const key = slugDir(`${h._show}-s${h._season ?? "0"}-e${h._episode}`);
-          const existing = byEpisode.get(key);
-          if (!existing) {
-            byEpisode.set(key, h);
-          } else {
-            // Prefer MeGusta > HEVC > anything
-            const newTitle = h._rawTitle ?? "";
-            const oldTitle = existing._rawTitle ?? "";
-            const newScore = (newTitle.includes("MeGusta") ? 10 : 0) +
-              (newTitle.includes("HEVC") || newTitle.includes("x265") ? 5 : 0);
-            const oldScore = (oldTitle.includes("MeGusta") ? 10 : 0) +
-              (oldTitle.includes("HEVC") || oldTitle.includes("x265") ? 5 : 0);
-            if (newScore > oldScore) {
-              byEpisode.set(key, h);
-            }
-          }
-        }
-
-        const finalEpisodes = [...byEpisode.values()].map((h) => h._data);
+        const finalEpisodes = pickPreferred(handles).map((h) => h._data);
 
         const handle = await context.writeResource("episodes", "current", {
           episodes: finalEpisodes,
