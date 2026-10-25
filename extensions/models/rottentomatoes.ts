@@ -102,7 +102,12 @@ const MovieSchema = z.object({
   browseList: z.enum(["at_home", "in_theaters", "coming_soon"]).describe(
     "Which RT movie shelf this was last seen on",
   ),
-  browseSort: z.enum(["popular", "newest", "critic_highest", "audience_highest"])
+  browseSort: z.enum([
+    "popular",
+    "newest",
+    "critic_highest",
+    "audience_highest",
+  ])
     .describe("Which sort order this was last seen under"),
   // TMDB enrichment (null if no match)
   tmdbTitle: z.string().nullable(),

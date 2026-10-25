@@ -95,7 +95,10 @@ async function remoteRunRetry(
   return last;
 }
 
-async function remoteFileExists(cfg: RemoteCfg, path: string): Promise<boolean> {
+async function remoteFileExists(
+  cfg: RemoteCfg,
+  path: string,
+): Promise<boolean> {
   const { code } = await remoteRun(cfg, ["test", "-f", path]);
   return code === 0;
 }

@@ -198,11 +198,19 @@ const CalibrationSchema = z.object({
   calibratedAt: z.string(),
   rubric: RubricSchema,
   total: z.number().describe("Catalogue shows answered by the evaluator."),
-  unanswered: z.number().describe("Pack items with no answer since the pack was built."),
+  unanswered: z.number().describe(
+    "Pack items with no answer since the pack was built.",
+  ),
   watchCount: z.number(),
-  recall: z.number().describe("watchCount / total — share of known watches the rubric recovers."),
-  byRule: z.record(z.string(), z.number()).describe("Verdict count per deciding rule."),
-  byLane: z.record(z.string(), z.number()).describe("Watch count per lane, including hook: lanes."),
+  recall: z.number().describe(
+    "watchCount / total — share of known watches the rubric recovers.",
+  ),
+  byRule: z.record(z.string(), z.number()).describe(
+    "Verdict count per deciding rule.",
+  ),
+  byLane: z.record(z.string(), z.number()).describe(
+    "Watch count per lane, including hook: lanes.",
+  ),
   statements: z.array(z.object({
     id: z.string(),
     role: z.enum(["hook", "offLane", "veto"]),
@@ -462,7 +470,11 @@ function evaluateShow(
       lane: null,
       score,
       reason: `Reads as ${offLane.id} (${pct(offLane.p)})${
-        rubric.hook ? `, over its strongest hook ${rubric.hook.id} (${pct(rubric.hook.p)})` : ""
+        rubric.hook
+          ? `, over its strongest hook ${rubric.hook.id} (${
+            pct(rubric.hook.p)
+          })`
+          : ""
       }.`,
       rule: "rubric-off-lane",
       decidedBy: offLane.id,
@@ -716,7 +728,9 @@ async function readPersona(
   if (!fm) return { persona: text, personaLabel, rubric: null };
   // deno-lint-ignore no-explicit-any
   const meta: any = parseYaml(fm[1]) ?? {};
-  const rubric = meta.rubric === undefined ? null : RubricSchema.parse(meta.rubric);
+  const rubric = meta.rubric === undefined
+    ? null
+    : RubricSchema.parse(meta.rubric);
   if (rubric) {
     const ids = [
       ...Object.keys(rubric.hook),
@@ -1328,7 +1342,11 @@ export const model = {
         "Join the evaluator's evaluation-<name> rubric answers onto the latest typesafe-pack, run them through the persona rules, and write the ranked `recommendations-typesafe` instance for the report.",
       arguments: AggregateTypesafeArgs,
       execute: async (args, context) => {
-        const pack = await readOwnPack(context, "typesafe-pack", "pack_typesafe");
+        const pack = await readOwnPack(
+          context,
+          "typesafe-pack",
+          "pack_typesafe",
+        );
         const evaluator = await findEvaluator(context, args.evaluatorModel);
         const collectedAt = Date.parse(pack.collectedAt);
 
@@ -1453,9 +1471,12 @@ export const model = {
           );
         }
         // deno-lint-ignore no-explicit-any
-        const series: any[] = JSON.parse(new TextDecoder().decode(bytes)).items ?? [];
+        const series: any[] =
+          JSON.parse(new TextDecoder().decode(bytes)).items ?? [];
         if (series.length === 0) {
-          throw new Error(`${args.catalogModel} '${args.library}' has no series.`);
+          throw new Error(
+            `${args.catalogModel} '${args.library}' has no series.`,
+          );
         }
 
         // One item per show, keyed on TMDB id where Jellyfin matched one.
@@ -1465,9 +1486,12 @@ export const model = {
         }>();
         for (const s of series) {
           const id = String(s.providerIds?.Tmdb ?? s.id);
-          const name = `cat-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 63);
+          const name = `cat-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-")
+            .slice(0, 63);
           if (byName.has(name)) continue;
-          const year = s.productionYear != null ? String(s.productionYear) : null;
+          const year = s.productionYear != null
+            ? String(s.productionYear)
+            : null;
           const genres: string[] = s.genres ?? [];
           const networks: string[] = s.studios ?? [];
           byName.set(name, {
@@ -1521,7 +1545,11 @@ export const model = {
         "Score the evaluator's rubric answers for the catalogue-pack with the persona rules (lane fit only, no RT bar) and write `rubric-calibration`: recall on shows the group already chose, per-statement stats, and the misses to tune against.",
       arguments: CalibrateArgs,
       execute: async (args, context) => {
-        const pack = await readOwnPack(context, "catalogue-pack", "pack_catalogue");
+        const pack = await readOwnPack(
+          context,
+          "catalogue-pack",
+          "pack_catalogue",
+        );
         const evaluator = await findEvaluator(context, args.evaluatorModel);
         const collectedAt = Date.parse(pack.collectedAt);
 
@@ -1589,7 +1617,9 @@ export const model = {
           );
         }
 
-        misses.sort((a, b) => a.rule.localeCompare(b.rule) || a.title.localeCompare(b.title));
+        misses.sort((a, b) =>
+          a.rule.localeCompare(b.rule) || a.title.localeCompare(b.title)
+        );
         const round = (n: number) => Math.round(n * 1000) / 1000;
         const statements = Object.keys(pack.questions).map((id) => ({
           id,
