@@ -119,9 +119,18 @@ type Extraction = z.infer<typeof ExtractionSchema>;
 // stable instance name so each batch versions the same resource — the version
 // history is the run history.
 const RunSchema = z.object({
-  cutoff: z.iso.datetime().describe("Lower bound of the organizer-job window"),
-  windowMinutes: z.number().describe("Window size used for this run"),
-  jobs: z.number().describe("Organized jobs considered"),
+  cutoff: z.iso.datetime().optional().describe(
+    "Lower bound of the organizer-job window (extract_recent)",
+  ),
+  windowMinutes: z.number().optional().describe(
+    "Window size used for this run (extract_recent)",
+  ),
+  paths: z.array(z.string()).optional().describe(
+    "Directories walked (extract_dir)",
+  ),
+  jobs: z.number().describe(
+    "Organized jobs (extract_recent) or MKVs found (extract_dir) considered",
+  ),
   extracted: z.number().describe("Tracks newly extracted to .srt"),
   skipped: z.number().describe(
     "Files skipped (existing .srt, overwrite=false)",
@@ -217,7 +226,7 @@ function pickStream(
 
 export const model = {
   type: "@keeb/mms/subtitles",
-  version: "2026.07.20.2",
+  version: "2026.10.25.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     // Single-file `extract` writes one of these (deliberate, manual). The batch
@@ -365,8 +374,95 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+    extract_dir: {
+      description:
+        "Batch-extract subtitles from every MKV under catalog directories (backfill)",
+      arguments: z.object({
+        paths: z.array(z.string()).min(1).describe(
+          "Catalog directories to walk",
+        ),
+        recursive: z.boolean().default(true).describe(
+          "Walk subdirectories too",
+        ),
+        language: z
+          .string()
+          .default("eng")
+          .describe("Preferred subtitle language tag (ISO 639-2)"),
+        overwrite: z
+          .boolean()
+          .default(false)
+          .describe("Overwrite an existing .srt next to the source"),
+      }),
+      execute: async (
+        args: {
+          paths: string[];
+          recursive: boolean;
+          language: string;
+          overwrite: boolean;
+        },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const cfg = remoteCfg(context.globalArgs);
+        const files: string[] = [];
+        for (const p of args.paths) {
+          files.push(...await listMkvs(p.replace(/\/$/, ""), args.recursive));
+        }
+        files.sort();
+        context.logger.info(
+          `Found ${files.length} MKV(s) under ${args.paths.length} path(s)`,
+        );
+        const results: Extraction[] = [];
+        const failures: { source: string; error: string }[] = [];
+        for (const file of files) {
+          try {
+            results.push(
+              await extractOne(
+                cfg,
+                file,
+                args.language,
+                args.overwrite,
+                context,
+              ),
+            );
+          } catch (err) {
+            context.logger.warn(`Skip ${file}: ${err}`);
+            failures.push({ source: file, error: String(err) });
+          }
+        }
+        const extracted =
+          results.filter((r) => r.status === "extracted").length;
+        const skipped = results.filter((r) => r.status === "skipped").length;
+        context.logger.info(
+          `Run: ${extracted} extracted, ${skipped} skipped, ` +
+            `${failures.length} failed across ${files.length} file(s)`,
+        );
+        const handle = await context.writeResource("run", "extract-dir", {
+          paths: args.paths,
+          jobs: files.length,
+          extracted,
+          skipped,
+          failed: failures.length,
+          results,
+          failures,
+          ranAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
   },
 };
+
+/** Every .mkv under a swamp-space directory, optionally recursive. */
+async function listMkvs(dir: string, recursive: boolean): Promise<string[]> {
+  const out: string[] = [];
+  for await (const e of Deno.readDir(dir)) {
+    const p = `${dir}/${e.name}`;
+    if (e.isDirectory && recursive) out.push(...await listMkvs(p, true));
+    else if (e.isFile && e.name.toLowerCase().endsWith(".mkv")) out.push(p);
+  }
+  return out;
+}
 
 // `localPath` is a swamp-space path; every filesystem touch happens on the
 // remote host under the mapped path. The resource we return records the

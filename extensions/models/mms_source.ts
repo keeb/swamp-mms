@@ -41,6 +41,13 @@ const ShowConfigSchema = z.object({
     .string()
     .optional()
     .describe("Custom EZTV RSS URL (defaults to myrss.org/eztv)"),
+  eztvImdbId: z
+    .string()
+    .optional()
+    .describe(
+      "IMDb ID (tt0239195). When set, search EZTV's archival API for this " +
+        "show instead of the rolling RSS feed",
+    ),
   newznabUrl: z
     .string()
     .optional()
@@ -77,7 +84,10 @@ const EpisodeSchema = z.object({
     "Canonical catalog slug from ShowConfig (overrides parsed title in dedup)",
   ),
   episode: z.string().optional().describe(
-    "Episode number (extracted for subsplease, absent for nyaa)",
+    "Episode number (extracted for subsplease and the EZTV API, absent for nyaa)",
+  ),
+  season: z.string().optional().describe(
+    "Season number (EZTV API); with slug + episode, dedup checks disk without the LLM",
   ),
   magnet: z.string().describe(
     "Download URI (magnet for torrents, NZB URL for usenet)",
@@ -318,7 +328,8 @@ function matchEztvItems(
     const title = item.title ?? item["torrent:fileName"];
     if (!title) continue;
 
-    if (!title.toLowerCase().includes(normalizedQuery)) continue;
+    // API items are already scoped to the show by IMDb ID
+    if (!item._api && !title.toLowerCase().includes(normalizedQuery)) continue;
     if (
       !title.includes(`${normalizedRes}p`) && !title.includes(normalizedRes)
     ) continue;
@@ -353,6 +364,9 @@ function matchEztvItems(
       rawTitle: title,
       publishDate: item.pubDate,
       seeders,
+      season: item._season,
+      episode: item._episode,
+      size: item._size,
       _score: score,
     });
   }
@@ -396,6 +410,103 @@ function matchEztvItems(
   return clean;
 }
 
+// EZTV's JSON API keeps every torrent for a show; the RSS feed only the
+// latest ~30 across all shows. Mirrors tried in order.
+const EZTV_API_MIRRORS = ["https://eztvx.to", "https://eztv.wf"];
+const EZTV_API_PAGE = 100;
+
+/** `SxxEyy` key for an episode, used to match the onlyEpisodes filter. */
+export function episodeKey(
+  season: string | number | undefined,
+  episode: string | number | undefined,
+): string | null {
+  const s = parseInt(String(season ?? ""));
+  const e = parseInt(String(episode ?? ""));
+  return Number.isFinite(s) && Number.isFinite(e) && e > 0
+    ? `S${s}E${e}`
+    : null;
+}
+
+/** `SxxEyy` key from a release title (RSS items carry no season/episode). */
+export function episodeKeyFromTitle(title?: string): string | null {
+  const m = title?.match(/S(\d+)E(\d+)/i);
+  return m ? episodeKey(m[1], m[2]) : null;
+}
+
+/**
+ * Map an EZTV API torrent into the RSS item shape matchEztvItems reads. The
+ * title is the release filename without extension (what lands on disk), and
+ * season/episode ride along so dedup needs no LLM. Season packs (episode 0)
+ * carry no episode.
+ */
+// deno-lint-ignore no-explicit-any
+export function eztvApiItem(t: any): any {
+  const title = t.filename
+    ? String(t.filename).replace(/\.[a-z0-9]{2,4}$/i, "")
+    : String(t.title ?? "");
+  const hasEpisode = episodeKey(t.season, t.episode) !== null;
+  return {
+    _api: true,
+    title,
+    "torrent:magnetURI": t.magnet_url ?? "",
+    "torrent:infoHash": t.hash ?? "",
+    "torrent:seeds": String(t.seeds ?? 0),
+    pubDate: t.date_released_unix
+      ? new Date(Number(t.date_released_unix) * 1000).toISOString()
+      : undefined,
+    _season: hasEpisode ? String(parseInt(t.season)) : undefined,
+    _episode: hasEpisode ? String(parseInt(t.episode)) : undefined,
+    _size: Number(t.size_bytes) || undefined,
+  };
+}
+
+/**
+ * Newest-first pages of a show's EZTV torrents. With `wanted` episode keys,
+ * keeps paging (up to maxPages) until every one has turned up; without, one
+ * page.
+ */
+async function fetchEztvApi(
+  imdbId: string,
+  wanted: Set<string> | null,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+  maxPages = 20,
+  // deno-lint-ignore no-explicit-any
+): Promise<any[]> {
+  const id = imdbId.replace(/^tt/i, "");
+  let lastErr: unknown = null;
+  for (const base of EZTV_API_MIRRORS) {
+    try {
+      // deno-lint-ignore no-explicit-any
+      const items: any[] = [];
+      const seen = new Set<string>();
+      const pages = wanted ? maxPages : 1;
+      for (let page = 1; page <= pages; page++) {
+        const url =
+          `${base}/api/get-torrents?imdb_id=${id}&limit=${EZTV_API_PAGE}&page=${page}`;
+        logger.info(`EZTV API: ${url}`);
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`EZTV API error: ${resp.status}`);
+        const json = await resp.json();
+        const torrents = Array.isArray(json?.torrents) ? json.torrents : [];
+        for (const t of torrents) {
+          const item = eztvApiItem(t);
+          items.push(item);
+          const key = episodeKey(item._season, item._episode);
+          if (key) seen.add(key);
+        }
+        if (torrents.length < EZTV_API_PAGE) break;
+        if (wanted && [...wanted].every((k) => seen.has(k))) break;
+      }
+      return items;
+    } catch (err) {
+      lastErr = err;
+      logger.warning(`EZTV API mirror ${base} failed: ${err}`);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
 async function searchEztv(
   query: string,
   resolution: string,
@@ -404,9 +515,13 @@ async function searchEztv(
   eztvUrl?: string,
   preferGroup?: string,
   preferCodec?: string,
+  eztvImdbId?: string,
+  wanted: Set<string> | null = null,
   // deno-lint-ignore no-explicit-any
 ): Promise<{ items: any[]; rawHitCount: number }> {
-  const feedItems = await fetchEztvFeed(logger, eztvUrl);
+  const feedItems = eztvImdbId
+    ? await fetchEztvApi(eztvImdbId, wanted, logger)
+    : await fetchEztvFeed(logger, eztvUrl);
   const items = matchEztvItems(
     feedItems,
     query,
@@ -548,7 +663,7 @@ async function searchNewznab(
 
 export const model = {
   type: "@keeb/mms/source",
-  version: "2026.07.09.1",
+  version: "2026.10.25.1",
   reports: ["@keeb/mms/discovery-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -667,6 +782,17 @@ export const model = {
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
+    {
+      fromVersion: "2026.07.09.1",
+      toVersion: "2026.10.25.1",
+      description:
+        "EZTV archival search: optional `eztvImdbId` (ShowConfig and search) " +
+        "uses EZTV's JSON API instead of the rolling RSS feed, and items " +
+        "carry season/episode. `search` gains `slug` and `onlyEpisodes` " +
+        "(keep just the episodes dedup reported missing).",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
   ],
   resources: {
     episodes: {
@@ -700,6 +826,18 @@ export const model = {
         nyaaUser: z.string().optional().describe("Nyaa uploader filter"),
         nyaaQuery: z.string().optional().describe("Override search query"),
         eztvUrl: z.string().optional().describe("Custom EZTV RSS URL"),
+        eztvImdbId: z.string().optional().describe(
+          "IMDb ID (tt0239195): search EZTV's archival API instead of the rolling RSS feed",
+        ),
+        slug: z.string().optional().describe(
+          "Canonical catalog slug, stamped on every item (dedup checks disk at /<slug>/s<N>)",
+        ),
+        onlyEpisodes: z.array(z.object({
+          season: z.union([z.string(), z.number()]).optional(),
+          episode: z.union([z.string(), z.number()]).optional(),
+        })).optional().describe(
+          "Keep only these episodes, e.g. dedup's missing items; anything else is dropped",
+        ),
         newznabUrl: z.string().optional().describe("Newznab API base URL"),
         newznabApiKey: z.string().optional().meta({ sensitive: true }).describe(
           "Newznab API key",
@@ -722,6 +860,12 @@ export const model = {
           nyaaUser?: string;
           nyaaQuery?: string;
           eztvUrl?: string;
+          eztvImdbId?: string;
+          slug?: string;
+          onlyEpisodes?: {
+            season?: string | number;
+            episode?: string | number;
+          }[];
           newznabUrl?: string;
           newznabApiKey?: string;
           newznabCat?: string;
@@ -730,6 +874,13 @@ export const model = {
         // deno-lint-ignore no-explicit-any
         context: any,
       ) => {
+        const wanted = args.onlyEpisodes
+          ? new Set(
+            args.onlyEpisodes
+              .map((e) => episodeKey(e.season, e.episode))
+              .filter((k): k is string => k !== null),
+          )
+          : null;
         // deno-lint-ignore no-explicit-any
         let items: any[] = [];
         let rawHitCount = 0;
@@ -755,6 +906,8 @@ export const model = {
               args.eztvUrl,
               args.preferGroup,
               args.preferCodec,
+              args.eztvImdbId,
+              wanted,
             )
             : args.provider === "newznab"
             ? await searchNewznab(
@@ -775,6 +928,21 @@ export const model = {
             );
           items = result.items;
           rawHitCount = result.rawHitCount;
+          if (wanted) {
+            items = items.filter((it) => {
+              const key = episodeKey(it.season, it.episode) ??
+                episodeKeyFromTitle(it.rawTitle);
+              return key !== null && wanted.has(key);
+            });
+            context.logger.info(
+              `Kept ${items.length} item(s) for ${wanted.size} wanted episode(s): ${
+                [...wanted].join(", ")
+              }`,
+            );
+          }
+          if (args.slug) {
+            items = items.map((it) => ({ ...it, slug: args.slug }));
+          }
         } catch (err) {
           // Don't throw: a provider failure must surface as a legible
           // non-answer (empty episodes + providerStatus=error), not a crash a
@@ -817,7 +985,9 @@ export const model = {
 
         // Pull EZTV feed once for all eztv shows
         // deno-lint-ignore no-explicit-any
-        const eztvShows = shows.filter((s: any) => s.provider === "eztv");
+        const eztvShows = shows.filter((s: any) =>
+          s.provider === "eztv" && !s.eztvImdbId
+        );
         // deno-lint-ignore no-explicit-any
         let eztvFeedItems: any[] | null = null;
         if (eztvShows.length > 0) {
@@ -835,7 +1005,17 @@ export const model = {
           try {
             // deno-lint-ignore no-explicit-any
             let items: any[];
-            if (show.provider === "eztv" && eztvFeedItems !== null) {
+            if (show.provider === "eztv" && show.eztvImdbId) {
+              items = (await searchEztv(
+                show.name,
+                show.resolution ?? "1080",
+                context.logger,
+                show.eztvUrl,
+                show.preferGroup,
+                show.preferCodec,
+                show.eztvImdbId,
+              )).items;
+            } else if (show.provider === "eztv" && eztvFeedItems !== null) {
               items = matchEztvItems(
                 eztvFeedItems,
                 show.name,

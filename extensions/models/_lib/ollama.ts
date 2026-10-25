@@ -1,8 +1,15 @@
+/**
+ * One chat turn against Ollama. `format` is passed through as Ollama's
+ * structured-output constraint: "json" or a JSON Schema object, in which case
+ * decoding is grammar-constrained to that shape.
+ */
 export async function ollamaGenerate(
   ollamaUrl: string,
   model: string,
   prompt: string,
   input: string,
+  // deno-lint-ignore no-explicit-any
+  format?: "json" | Record<string, any>,
 ): Promise<string> {
   const resp = await fetch(`${ollamaUrl}/api/chat`, {
     method: "POST",
@@ -13,6 +20,7 @@ export async function ollamaGenerate(
       stream: false,
       options: { num_predict: 1024, temperature: 0 },
       think: false,
+      ...(format ? { format } : {}),
     }),
   });
 

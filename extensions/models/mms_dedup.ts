@@ -24,7 +24,9 @@ export const EpisodeSchema = z.object({
   show: z.string().describe("Show name"),
   episode: z.string().describe("Episode number"),
   season: z.string().optional().describe("Season number"),
-  magnet: z.string().describe("Download URI"),
+  magnet: z.string().optional().describe(
+    "Download URI; absent for structured sources (e.g. @keeb/predb) that only report an episode aired",
+  ),
   provider: z.string().describe("Source provider"),
   resolution: z.string().describe("Video resolution"),
   protocol: z.enum(["torrent", "usenet"]).optional().describe(
@@ -246,7 +248,7 @@ export function pickPreferred<
 
 export const model = {
   type: "@keeb/mms/dedup",
-  version: "2026.10.23.1",
+  version: "2026.10.25.1",
   reports: ["@keeb/mms/dedup-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -304,6 +306,15 @@ export const model = {
         "Ignore version suffixes (01v2) when checking disk and when picking " +
         "one candidate per episode; strict season match when the release " +
         "title states SxxEyy, so a sequel's E04 isn't satisfied by S01E04.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.10.23.1",
+      toVersion: "2026.10.25.1",
+      description:
+        "`magnet` is optional on output episodes: structured sources " +
+        "(@keeb/predb) report aired episodes without a download URI.",
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
