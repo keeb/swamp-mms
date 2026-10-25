@@ -109,11 +109,19 @@ const AddBatchSchema = z.object({
   timestamp: z.iso.datetime().describe("When this add invocation completed"),
 });
 
+const BlocklistSchema = z.object({
+  url: z.string().describe("Blocklist URL Transmission fetched from"),
+  enabled: z.boolean().describe("Whether Transmission enforces the blocklist"),
+  previousSize: z.number().describe("Rules loaded before the update"),
+  size: z.number().describe("Rules loaded after the update"),
+  updatedAt: z.iso.datetime().describe("When the update completed"),
+});
+
 // --- Model ---
 
 export const model = {
   type: "@keeb/mms/downloader",
-  version: "2026.05.10.1",
+  version: "2026.10.25.1",
   upgrades: [
     {
       fromVersion: "2026.03.28.1",
@@ -159,6 +167,14 @@ export const model = {
         "delegating to sab's opaque addurl path.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      fromVersion: "2026.05.10.1",
+      toVersion: "2026.10.25.1",
+      description: "Add blocklist_update method — has Transmission re-fetch " +
+        "its peer blocklist and records the rule count in a blocklist " +
+        "resource.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
   reports: ["@keeb/mms/download-status", "@keeb/mms/add-summary"],
   globalArguments: GlobalArgsSchema,
@@ -176,8 +192,106 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 20,
     },
+    blocklist: {
+      description:
+        "Result of a blocklist_update call — URL, enabled flag, and rule counts before/after",
+      schema: BlocklistSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 20,
+    },
   },
   methods: {
+    blocklist_update: {
+      description:
+        "Have Transmission re-download its peer blocklist. Optionally set the blocklist URL and enable it first.",
+      arguments: z.object({
+        url: z
+          .string()
+          .optional()
+          .describe(
+            "Blocklist URL to configure before updating; omit to keep Transmission's current one",
+          ),
+      }),
+      execute: async (
+        args: { url?: string },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const { transmissionUrl, transmissionUser, transmissionPassword } =
+          context.globalArgs;
+        if (!transmissionUrl) {
+          throw new Error("transmissionUrl is required");
+        }
+        const auth = transmissionUser && transmissionPassword
+          ? { user: transmissionUser, password: transmissionPassword }
+          : undefined;
+
+        const { result: session, sessionId } = await transmissionRpc(
+          transmissionUrl,
+          "session-get",
+          { fields: ["blocklist-enabled", "blocklist-url", "blocklist-size"] },
+          auth,
+        );
+        // deno-lint-ignore no-explicit-any
+        const s: any = (session as any).arguments ?? {};
+        const previousSize: number = s["blocklist-size"] ?? 0;
+        let url: string = s["blocklist-url"] ?? "";
+        let enabled: boolean = s["blocklist-enabled"] ?? false;
+
+        if ((args.url && args.url !== url) || (args.url && !enabled)) {
+          const { result } = await transmissionRpc(
+            transmissionUrl,
+            "session-set",
+            { "blocklist-url": args.url, "blocklist-enabled": true },
+            auth,
+            sessionId,
+          );
+          // deno-lint-ignore no-explicit-any
+          if ((result as any).result !== "success") {
+            throw new Error(
+              // deno-lint-ignore no-explicit-any
+              `session-set failed: ${(result as any).result}`,
+            );
+          }
+          context.logger.info(`Blocklist URL set to ${args.url}`);
+          url = args.url;
+          enabled = true;
+        }
+        if (!url) {
+          throw new Error(
+            "Transmission has no blocklist URL configured; pass --input url=<blocklist>",
+          );
+        }
+
+        const { result } = await transmissionRpc(
+          transmissionUrl,
+          "blocklist-update",
+          {},
+          auth,
+          sessionId,
+        );
+        // deno-lint-ignore no-explicit-any
+        const r: any = result;
+        if (r.result !== "success") {
+          throw new Error(`blocklist-update failed: ${r.result}`);
+        }
+        const size: number = r.arguments?.["blocklist-size"] ?? 0;
+        context.logger.info(
+          `Blocklist updated from ${url}: ${previousSize} -> ${size} rules` +
+            (enabled ? "" : " (blocklist is DISABLED in Transmission)"),
+        );
+
+        const handle = await context.writeResource("blocklist", "current", {
+          url,
+          enabled,
+          previousSize,
+          size,
+          updatedAt: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
     add: {
       description:
         "Add a download to the appropriate backend (Transmission for torrents, SABnzbd for usenet)",

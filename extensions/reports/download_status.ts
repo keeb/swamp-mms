@@ -5,7 +5,10 @@ export const report = {
   labels: ["status"],
   // deno-lint-ignore no-explicit-any
   execute: async (context: any) => {
-    const handles = context.dataHandles || [];
+    const handles = (context.dataHandles || []).filter(
+      // deno-lint-ignore no-explicit-any
+      (h: any) => h?.metadata?.tags?.specName === "download",
+    );
 
     if (handles.length === 0) {
       return {
