@@ -1,7 +1,7 @@
 export const report = {
   name: "@keeb/mms/tv-recommendations",
   description:
-    "Render the host's Watch/Skip verdicts for a tv_recommender.aggregate run — sorted by confidence within Watch, then Skip, then Unparsed.",
+    "Render the host's Watch/Skip verdicts for a tv_recommender.evaluate, aggregate_typesafe (or legacy aggregate) run — sorted by score within Watch, then Skip.",
   scope: "method" as const,
   labels: ["recommendations", "host"],
   // deno-lint-ignore no-explicit-any
@@ -12,10 +12,16 @@ export const report = {
     const modelType = context.modelType;
     const modelId = context.definition.id;
 
-    if (method !== "aggregate") {
+    // All writers emit the `recommendations` spec: `evaluate` is the
+    // deterministic path, `aggregate_typesafe` the TypeSafe one (instance
+    // `recommendations-typesafe`), `aggregate` the legacy Claude one.
+    if (
+      method !== "evaluate" && method !== "aggregate" &&
+      method !== "aggregate_typesafe"
+    ) {
       return {
         markdown:
-          `# TV Recommendations\n\nReport scoped to aggregate; skipped for ${modelName}.${method}.\n`,
+          `# TV Recommendations\n\nReport scoped to evaluate/aggregate; skipped for ${modelName}.${method}.\n`,
         json: { status, skipped: true },
       };
     }
@@ -59,6 +65,7 @@ export const report = {
       verdict: "Watch" | "Skip" | "Unparsed";
       lane: string | null;
       score: number | null;
+      confidence?: number | null;
       reason: string;
       rawResponse: string;
     };
@@ -87,6 +94,8 @@ export const report = {
       s.replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
     const yr = (v: Verdict) => v.year ? String(v.year).slice(0, 4) : "—";
     const sc = (v: Verdict) => v.score !== null ? String(v.score) : "—";
+    const conf = (v: Verdict) =>
+      v.confidence != null ? v.confidence.toFixed(2) : "—";
     const laneShort = (v: Verdict) => {
       if (!v.lane) return "—";
       const map: Record<string, string> = {
@@ -103,14 +112,15 @@ export const report = {
       "",
       `${rec.watchCount} Watch · ${rec.skipCount} Skip · ${rec.unparsedCount} Unparsed · ${rec.total} total`,
       "",
-      "| Verdict | Score | Title | Year | Lane |",
-      "|---|---:|---|---|---|",
+      "| Verdict | Score | Confidence | Title | Year | Lane |",
+      "|---|---:|---:|---|---|---|",
     ];
     for (const v of sorted) {
       lines.push(
         "| " + [
           v.verdict,
           sc(v),
+          conf(v),
           cell(v.title),
           yr(v),
           laneShort(v),
@@ -152,6 +162,7 @@ export const report = {
           verdict: v.verdict,
           lane: v.lane,
           score: v.score,
+          confidence: v.confidence ?? null,
           reason: v.reason,
         })),
       },

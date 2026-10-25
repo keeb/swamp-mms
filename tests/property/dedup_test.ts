@@ -83,18 +83,30 @@ Deno.test("fileExistsInIndex: finds canonical SubsPlease filenames", () => {
 Deno.test("fileExistsInIndex: never matches an empty index", () => {
   fc.assert(
     fc.property(episodeArb, (ep) => {
-      assertEquals(fileExistsInIndex(ep.show, ep.episode, [], noopLogger), false);
+      assertEquals(
+        fileExistsInIndex(ep.show, ep.episode, [], noopLogger),
+        false,
+      );
     }),
   );
 });
 
 Deno.test("fileExistsInDest: total over schema-valid episodes", () => {
   const destPathArb = fc
-    .array(fc.string({ minLength: 1 }).map(slugDir), { minLength: 1, maxLength: 3 })
+    .array(fc.string({ minLength: 1 }).map(slugDir), {
+      minLength: 1,
+      maxLength: 3,
+    })
     .map((parts) => "/" + parts.filter(Boolean).join("/"));
   fc.assert(
     fc.property(episodeArb, destPathArb, fileIndexArb, (ep, dest, index) => {
-      const result = fileExistsInDest(dest, ep.season, ep.episode, index, noopLogger);
+      const result = fileExistsInDest(
+        dest,
+        ep.season,
+        ep.episode,
+        index,
+        noopLogger,
+      );
       assertEquals(typeof result, "boolean");
     }),
   );
@@ -119,6 +131,79 @@ Deno.test("fileExistsInDest: finds organized SxxExx files under the slug dir", (
       }];
       const dest = `/media/tv/${slug}/s${parseInt(season)}`;
       assert(fileExistsInDest(dest, season, episode, index, noopLogger));
+    }),
+  );
+});
+
+Deno.test("fileExistsInDest strictSeason: another season's same episode never counts", () => {
+  const slugArb = fc
+    .stringMatching(/^[a-z0-9]+(-[a-z0-9]+){0,3}$/)
+    .filter((s) => s.length > 0 && slugDir(s) === s);
+  const seasonArb = fc.integer({ min: 1, max: 40 });
+  const epArb = fc.integer({ min: 1, max: 99 });
+
+  fc.assert(
+    fc.property(
+      slugArb,
+      seasonArb,
+      seasonArb,
+      epArb,
+      (slug, want, have, ep) => {
+        fc.pre(want !== have);
+        const e = String(ep).padStart(2, "0");
+        const name = `${slug}.S${
+          String(have).padStart(2, "0")
+        }E${e}.1080p.WEB.mkv`;
+        const index = [{
+          name,
+          normalized: normalize(name),
+          path: `/media/tv/${slug}/s${have}/${name}`,
+        }];
+        const dest = `/media/tv/${slug}/s${want}`;
+        assert(
+          !fileExistsInDest(dest, String(want), String(ep), index, noopLogger, {
+            strictSeason: true,
+          }),
+        );
+      },
+    ),
+  );
+});
+
+Deno.test("fileExistsInDest strictSeason: AHS S13E07 is not S01E07; bare numbering needs the right season dir", () => {
+  const file = (path: string) => {
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    return { name, normalized: normalize(name), path };
+  };
+  const s1 = file(
+    "/v/shows/american-horror-story/s1/American.Horror.Story.S01E07.mkv",
+  );
+  const dest = "/v/shows/american-horror-story/s13";
+  // the old behavior, kept when the season is a guess
+  assert(fileExistsInDest(dest, "13", "7", [s1], noopLogger));
+  assert(
+    !fileExistsInDest(dest, "13", "7", [s1], noopLogger, {
+      strictSeason: true,
+    }),
+  );
+  const s13 = file(
+    "/v/shows/american-horror-story/s13/American.Horror.Story.S13E07.mkv",
+  );
+  assert(
+    fileExistsInDest(dest, "13", "7", [s1, s13], noopLogger, {
+      strictSeason: true,
+    }),
+  );
+  const bareWrong = file("/v/anime/show/s2/[Grp] Show - 07 (1080p).mkv");
+  const bareRight = file("/v/anime/show/s3/[Grp] Show - 07 (1080p).mkv");
+  assert(
+    !fileExistsInDest("/v/anime/show/s3", "3", "7", [bareWrong], noopLogger, {
+      strictSeason: true,
+    }),
+  );
+  assert(
+    fileExistsInDest("/v/anime/show/s3", "3", "7", [bareRight], noopLogger, {
+      strictSeason: true,
     }),
   );
 });
@@ -156,8 +241,18 @@ Deno.test("pickPreferred: subset, unique per key, MeGusta wins", () => {
   // A MeGusta release always beats a plain release for the same episode.
   fc.assert(
     fc.property(episodeArb, (ep) => {
-      const plain = { _show: ep.show, _episode: ep.episode, _season: ep.season, _rawTitle: "Some.Show.720p-Plain" };
-      const megusta = { _show: ep.show, _episode: ep.episode, _season: ep.season, _rawTitle: "Some.Show.1080p.HEVC-MeGusta" };
+      const plain = {
+        _show: ep.show,
+        _episode: ep.episode,
+        _season: ep.season,
+        _rawTitle: "Some.Show.720p-Plain",
+      };
+      const megusta = {
+        _show: ep.show,
+        _episode: ep.episode,
+        _season: ep.season,
+        _rawTitle: "Some.Show.1080p.HEVC-MeGusta",
+      };
       assertEquals(pickPreferred([plain, megusta]), [megusta]);
       assertEquals(pickPreferred([megusta, plain]), [megusta]);
     }),

@@ -1,7 +1,8 @@
 import { z } from "npm:zod@4";
 import { ollamaGenerate } from "./_lib/ollama.ts";
+import { newest } from "./_lib/latest.ts";
 
-// Prompt loaded at runtime from prompts/filename-to-json.prompt via context.repoDir
+// Prompts loaded at runtime from the bundled prompts/ via context.extensionFile
 
 // --- Schemas ---
 
@@ -124,6 +125,7 @@ export function fileExistsInDest(
   fileIndex: { name: string; normalized: string; path: string }[],
   // deno-lint-ignore no-explicit-any
   logger: any,
+  opts: { strictSeason?: boolean } = {},
 ): boolean {
   // Match by show slug. Accept the file via either of two anchors:
   //   1. path contains /<slug>/ — the canonical organized location.
@@ -150,14 +152,29 @@ export function fileExistsInDest(
     `[\\s\\-_\\.E]0?${escapeRegex(epPadded)}[\\s\\.\\[\\(v\\-]`,
   );
 
+  // strictSeason: the caller's season is authoritative (a structured source,
+  // not an LLM guess), so a bare episode number must not match another
+  // season's file. A filename carrying SxxEyy must match season and episode;
+  // one without it counts only outside a season dir or inside /<slug>/s<N>/.
+  const strict = Boolean(opts.strictSeason && seasonPadded);
+  const seasonDir = new RegExp(`/${escapeRegex(slug)}/s(\\d+)/`, "i");
+
   for (const file of fileIndex) {
     const dirAnchor = file.path.includes(slugMarker);
     const nameAnchor = file.normalized.includes(normalizedSlug);
     if (!dirAnchor && !nameAnchor) continue;
-    if (sePattern?.test(file.name) || epPattern.test(file.name)) {
+    if (sePattern?.test(file.name)) {
       logger.info(`Found: ${file.path}`);
       return true;
     }
+    if (!epPattern.test(file.name)) continue;
+    if (strict) {
+      if (/[Ss]\d{1,3}[Ee]\d{1,4}/.test(file.name)) continue;
+      const dir = file.path.match(seasonDir);
+      if (dir && parseInt(dir[1]) !== parseInt(season!)) continue;
+    }
+    logger.info(`Found: ${file.path}`);
+    return true;
   }
   return false;
 }
@@ -273,10 +290,10 @@ export const model = {
         // skip/new decision is consistent with where the organizer would
         // actually place the file.
         const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/filename-to-json.prompt`,
+          context.extensionFile("prompts/filename-to-json.md"),
         );
         const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/json-to-save-path.prompt`,
+          context.extensionFile("prompts/json-to-save-path.md"),
         );
 
         // Read the source model's latest run — a single aggregate record
@@ -296,8 +313,9 @@ export const model = {
           );
           return { dataHandles: [] };
         }
+        const latest = newest(records)!;
         // deno-lint-ignore no-explicit-any
-        const items = ((records[0].attributes.episodes as any[]) ?? []).map((
+        const items = ((latest.attributes.episodes as any[]) ?? []).map((
           // deno-lint-ignore no-explicit-any
           ep: any,
         ) => ({ attributes: ep }));
@@ -321,13 +339,26 @@ export const model = {
 
         for (const item of items) {
           const data = item.attributes;
-          if (!data.magnet) continue;
+          // Structured items (e.g. @keeb/predb radar) already carry the
+          // catalog slug plus season and episode: check disk directly at
+          // /<slug>/s<N>, no LLM. They may have no magnet: the source only
+          // reports that an episode exists, and dedup says if we have it.
+          const structured = Boolean(data.slug) && data.season != null &&
+            data.episode != null;
+          if (!data.magnet && !structured) continue;
 
           let show = data.show;
           let episode = data.episode;
           let season = data.season;
           let destPath: string | undefined;
           const isSubsPlease = data.provider === "subsplease";
+
+          if (structured) {
+            show = data.slug;
+            season = String(data.season);
+            episode = String(data.episode);
+            destPath = `/${data.slug}/s${parseInt(season)}`;
+          }
 
           // Nyaa items: always run the LLM pipeline (filename → JSON →
           // destPath). Regex on raw release titles is whack-a-mole: every new
@@ -336,7 +367,7 @@ export const model = {
           // prompts), inheriting any special cases already encoded there.
           // SubsPlease items skip parsing because the source RSS already
           // gives clean show+episode fields.
-          if (!isSubsPlease && data.rawTitle) {
+          if (!structured && !isSubsPlease && data.rawTitle) {
             try {
               const jsonStr = await ollamaGenerate(
                 ollamaUrl,
@@ -411,6 +442,7 @@ export const model = {
               episode,
               fileIndex,
               context.logger,
+              { strictSeason: structured },
             );
           } else {
             // SubsPlease items: trust source-provided show name; substring

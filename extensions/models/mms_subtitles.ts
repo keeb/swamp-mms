@@ -1,6 +1,104 @@
 import { z } from "npm:zod@4";
 
-const GlobalArgsSchema = z.object({});
+// ffmpeg has to stream the WHOLE container to demux an interleaved subtitle
+// track. The catalog lives on a network share, so doing that on the swamp box
+// saturates its mount. Instead we run ffprobe/ffmpeg on a remote host that sits
+// closer to storage, translating swamp-space paths into that host's mount.
+const GlobalArgsSchema = z.object({
+  remoteHost: z
+    .string()
+    .default("keeb@10.0.0.12")
+    .describe("ssh target (user@host) that runs ffprobe/ffmpeg"),
+  localPrefix: z
+    .string()
+    .default("/home/keeb/media/video")
+    .describe("Catalog path prefix as seen by swamp"),
+  remotePrefix: z
+    .string()
+    .default("/mnt/nami/media/video")
+    .describe("Catalog path prefix as mounted on remoteHost"),
+});
+
+interface RemoteCfg {
+  host: string;
+  localPrefix: string;
+  remotePrefix: string;
+}
+
+function remoteCfg(globalArgs: {
+  remoteHost: string;
+  localPrefix: string;
+  remotePrefix: string;
+}): RemoteCfg {
+  return {
+    host: globalArgs.remoteHost,
+    localPrefix: globalArgs.localPrefix.replace(/\/$/, ""),
+    remotePrefix: globalArgs.remotePrefix.replace(/\/$/, ""),
+  };
+}
+
+// Map a swamp-space path onto the remote host's mount. Paths outside the
+// catalog prefix pass through unchanged.
+function toRemote(cfg: RemoteCfg, path: string): string {
+  return path.startsWith(cfg.localPrefix)
+    ? cfg.remotePrefix + path.slice(cfg.localPrefix.length)
+    : path;
+}
+
+// Single-quote an argument for the remote login shell. ssh joins its command
+// args with spaces and re-parses them remotely, so filenames with spaces,
+// brackets and parens must be quoted or they get word-split.
+function shQuote(s: string): string {
+  return `'${s.replaceAll("'", `'\\''`)}'`;
+}
+
+// Multiplex every call in a batch over one ssh connection so we pay the
+// handshake once, not per file/per command.
+const SSH_OPTS = [
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "ConnectTimeout=10",
+  "-o",
+  "ControlMaster=auto",
+  "-o",
+  "ControlPath=/tmp/swamp-subs-ssh-%r@%h:%p",
+  "-o",
+  "ControlPersist=60",
+];
+
+async function remoteRun(
+  cfg: RemoteCfg,
+  argv: string[],
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const remoteCmd = argv.map(shQuote).join(" ");
+  return await runCmd("ssh", [...SSH_OPTS, cfg.host, remoteCmd]);
+}
+
+// ffprobe/ffmpeg run on a DIFFERENT host than the one that wrote the file, so
+// right after the organizer moves an MKV onto the share the remote's CIFS
+// client can briefly see the final size but not-yet-coherent data (EBML/EOF
+// errors). Retry the command a few times before treating a nonzero exit as a
+// real failure. "No text subs" is a logic throw AFTER a successful probe, so it
+// never reaches here — only genuine command failures get retried.
+async function remoteRunRetry(
+  cfg: RemoteCfg,
+  argv: string[],
+  attempts = 3,
+  delayMs = 3000,
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  let last = await remoteRun(cfg, argv);
+  for (let i = 1; i < attempts && last.code !== 0; i++) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    last = await remoteRun(cfg, argv);
+  }
+  return last;
+}
+
+async function remoteFileExists(cfg: RemoteCfg, path: string): Promise<boolean> {
+  const { code } = await remoteRun(cfg, ["test", "-f", path]);
+  return code === 0;
+}
 
 const ExtractionSchema = z.object({
   source: z.string().describe("Input MKV path"),
@@ -71,8 +169,12 @@ async function runCmd(
   };
 }
 
-async function probeSubtitles(path: string): Promise<SubtitleStream[]> {
-  const { stdout, stderr, code } = await runCmd("ffprobe", [
+async function probeSubtitles(
+  cfg: RemoteCfg,
+  remotePath: string,
+): Promise<SubtitleStream[]> {
+  const { stdout, stderr, code } = await remoteRunRetry(cfg, [
+    "ffprobe",
     "-v",
     "error",
     "-select_streams",
@@ -81,7 +183,7 @@ async function probeSubtitles(path: string): Promise<SubtitleStream[]> {
     "stream=index,codec_name:stream_tags=language,title:stream_disposition=forced,hearing_impaired",
     "-of",
     "json",
-    path,
+    remotePath,
   ]);
   if (code !== 0) {
     throw new Error(`ffprobe failed (${code}): ${stderr}`);
@@ -112,7 +214,7 @@ function pickStream(
 
 export const model = {
   type: "@keeb/mms/subtitles",
-  version: "2026.07.03.1",
+  version: "2026.07.20.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     // Single-file `extract` writes one of these (deliberate, manual). The batch
@@ -151,7 +253,9 @@ export const model = {
         // deno-lint-ignore no-explicit-any
         context: any,
       ) => {
+        const cfg = remoteCfg(context.globalArgs);
         const result = await extractOne(
+          cfg,
           args.path,
           args.language,
           args.overwrite,
@@ -193,6 +297,7 @@ export const model = {
         // deno-lint-ignore no-explicit-any
         context: any,
       ) => {
+        const cfg = remoteCfg(context.globalArgs);
         const cutoff = new Date(
           Date.now() - args.windowMinutes * 60 * 1000,
         ).toISOString();
@@ -220,6 +325,7 @@ export const model = {
 
           try {
             const result = await extractOne(
+              cfg,
               fullPath,
               args.language,
               args.overwrite,
@@ -259,41 +365,39 @@ export const model = {
   },
 };
 
+// `localPath` is a swamp-space path; every filesystem touch happens on the
+// remote host under the mapped path. The resource we return records the
+// swamp-space paths so the data model stays in one coordinate system.
 async function extractOne(
-  path: string,
+  cfg: RemoteCfg,
+  localPath: string,
   language: string,
   overwrite: boolean,
   // deno-lint-ignore no-explicit-any
   context: any,
   // deno-lint-ignore no-explicit-any
 ): Promise<any> {
-  const stat = await Deno.stat(path);
-  if (!stat.isFile) {
-    throw new Error(`Not a file: ${path}`);
-  }
-  if (!path.toLowerCase().endsWith(".mkv")) {
-    throw new Error(`Expected .mkv, got: ${path}`);
+  if (!localPath.toLowerCase().endsWith(".mkv")) {
+    throw new Error(`Expected .mkv, got: ${localPath}`);
   }
 
-  const output = path.replace(/\.mkv$/i, ".srt");
+  const remotePath = toRemote(cfg, localPath);
+  const localOutput = localPath.replace(/\.mkv$/i, ".srt");
+  const remoteOutput = toRemote(cfg, localOutput);
 
-  let exists = false;
-  try {
-    await Deno.stat(output);
-    exists = true;
-  } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
-  }
+  const exists = await remoteFileExists(cfg, remoteOutput);
 
-  const streams = await probeSubtitles(path);
+  // ffprobe fails on a missing/unreadable file, so it doubles as the source
+  // existence check — no extra round trip needed.
+  const streams = await probeSubtitles(cfg, remotePath);
   if (streams.length === 0) {
-    throw new Error(`No subtitle streams found in ${path}`);
+    throw new Error(`No subtitle streams found in ${localPath}`);
   }
   const chosen = pickStream(streams, language);
   if (!chosen) {
     const codecs = [...new Set(streams.map((s) => s.codec_name))].join(", ");
     throw new Error(
-      `No text subtitle stream in ${path} (found: ${codecs}). ` +
+      `No text subtitle stream in ${localPath} (found: ${codecs}). ` +
         `Bitmap subs (PGS/VobSub/DVB) require OCR and aren't supported.`,
     );
   }
@@ -303,10 +407,10 @@ async function extractOne(
   const lang = chosen.tags?.language;
 
   if (exists && !overwrite) {
-    context.logger.info(`Skipping (exists): ${output}`);
+    context.logger.info(`Skipping (exists): ${localOutput}`);
     return {
-      source: path,
-      output,
+      source: localPath,
+      output: localOutput,
       trackIndex,
       language: lang,
       codec,
@@ -318,27 +422,27 @@ async function extractOne(
   context.logger.info(
     `Extracting stream ${trackIndex} (${codec}, lang=${
       lang ?? "?"
-    }) → ${output}`,
+    }) on ${cfg.host} → ${localOutput}`,
   );
 
-  const ffmpegArgs = [
+  const { stderr, code } = await remoteRunRetry(cfg, [
+    "ffmpeg",
     "-y",
     "-i",
-    path,
+    remotePath,
     "-map",
     `0:${trackIndex}`,
     "-c:s",
     "srt",
-    output,
-  ];
-  const { stderr, code } = await runCmd("ffmpeg", ffmpegArgs);
+    remoteOutput,
+  ]);
   if (code !== 0) {
     throw new Error(`ffmpeg failed (${code}): ${stderr}`);
   }
 
   return {
-    source: path,
-    output,
+    source: localPath,
+    output: localOutput,
     trackIndex,
     language: lang,
     codec,

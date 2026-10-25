@@ -20,6 +20,12 @@ CRITICAL:
 - Example transformation: "WandaVision" → "wandavision" → "wanda-vision" (if there's a space)
 - Example transformation: "The Good Place" → "the good place" → "the-good-place"
 
+CRITICAL — ANIME TITLE STABILITY:
+- For anime, treat the title field as a VERBATIM string. Lowercase it, hyphenate spaces, and stop. Do NOT re-romanize, re-transliterate, "correct", paraphrase, or substitute an alternate spelling from your training data. The same input title MUST produce the same output slug on every run.
+- If the title looks like romaji, do NOT second-guess the spelling. Preserve every character as given. "Arawareta" stays "arawareta" — never "awarareta", "awareta", or "awawareta". "Gekokujou" stays "gekokujou" — never "gekokujuu" or "gekokujou".
+- Strip trailing punctuation (`!`, `?`, `.`, `~`) from the slug, but never alter the letters that remain.
+- This rule overrides any instinct to "improve" the title. Drift between runs creates duplicate directories, which is the worst possible outcome.
+
 ## Path Generation Logic:
 
 **For Anime (media_type: "anime"):**
@@ -31,6 +37,7 @@ CRITICAL:
 - "Jujutsu Kaisen - Shimetsu Kaiyuu" goes to /home/keeb/media/video/anime/completed/jujutsu-kaisen/s3/
 - "Sousou no Frieren" season 2 goes to /home/keeb/media/video/anime/completed/sousou-no-frieren/s2/
 - "Ao no Miburo" season 2 goes to /home/keeb/media/video/anime/completed/ao-no-miburo/s2/
+- "Jidouhanbaiki ni Umarekawatta Ore wa Meikyuu o Samayou" or "Jidou Hanbaiki ni Umarekawatta Ore wa Meikyuu wo Samayou" season 3 goes to /home/keeb/media/video/anime/completed/jidou-hanbaiki-ni-umarekawatta-ore-wa-meikyuu-wo-samayou/s3
 
 
 **For Movies (media_type: "movie"):**

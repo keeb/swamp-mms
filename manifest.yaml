@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/mms"
-version: "2026.07.03.1"
+version: "2026.09.16.1"
 description: "Media management system — content discovery, deduplication, download protocol handling, LLM-powered file organization, and subtitle extraction"
 repository: https://github.com/keeb/swamp-mms
 platforms: []
@@ -10,6 +10,9 @@ additionalFiles:
   - scripts/rottentomatoes-scraper.ts
   - scripts/package.json
   - personas/host.md
+  - prompts/filename-to-json.md
+  - prompts/anime-filename-to-json.md
+  - prompts/json-to-save-path.md
 labels:
   - media
   - anime

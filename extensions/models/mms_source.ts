@@ -102,6 +102,20 @@ const EpisodesSchema = z.object({
   episodes: z.array(EpisodeSchema).describe("All items from this run"),
   count: z.number().describe("Number of items in this run"),
   timestamp: z.string().describe("ISO timestamp when the run finished"),
+  queryEcho: z.string().optional().describe(
+    "The effective query actually sent to the provider (nyaaQuery override " +
+      "resolved). Lets a consumer confirm what was searched.",
+  ),
+  rawHitCount: z.number().optional().describe(
+    "Items the provider returned BEFORE resolution/batch/dedup filtering. " +
+      "A real empty (rawHitCount 0) is distinguishable from an over-filtered " +
+      "one (rawHitCount > 0 but count 0).",
+  ),
+  providerStatus: z.string().optional().describe(
+    "'ok' if the provider responded, otherwise the error. An empty " +
+      "`episodes` with providerStatus 'ok' is a trustworthy absence; with an " +
+      "error it is a non-answer, NOT proof the content is uncarried.",
+  ),
 });
 
 // --- SubsPlease ---
@@ -121,7 +135,7 @@ async function searchSubsPlease(
   // deno-lint-ignore no-explicit-any
   logger: any,
   // deno-lint-ignore no-explicit-any
-): Promise<any[]> {
+): Promise<{ items: any[]; rawHitCount: number }> {
   const encoded = encodeURIComponent(query);
   const url =
     `https://subsplease.org/api/?f=search&tz=America/New_York&s=${encoded}`;
@@ -129,7 +143,12 @@ async function searchSubsPlease(
   if (!resp.ok) throw new Error(`SubsPlease API error: ${resp.status}`);
 
   const data = await resp.json();
-  if (Array.isArray(data)) return [];
+  // SubsPlease returns [] when nothing matches, else an object keyed by
+  // "<show> - <ep>". rawHitCount is the pre-resolution-filter entry count.
+  if (Array.isArray(data)) return { items: [], rawHitCount: 0 };
+  const rawHitCount = Object.keys(
+    data as Record<string, SubsPleaseEntry>,
+  ).length;
 
   const batchPattern = /\d{2}-\d{2}/;
   // deno-lint-ignore no-explicit-any
@@ -165,8 +184,10 @@ async function searchSubsPlease(
     }
   }
 
-  logger.info(`SubsPlease: found ${results.length} episodes for "${query}"`);
-  return results;
+  logger.info(
+    `SubsPlease: found ${results.length} episodes for "${query}" (from ${rawHitCount} raw entries)`,
+  );
+  return { items: results, rawHitCount };
 }
 
 // --- Nyaa (general, no LLM) ---
@@ -181,7 +202,7 @@ async function searchNyaa(
   nyaaUser?: string,
   nyaaQuery?: string,
   // deno-lint-ignore no-explicit-any
-): Promise<any[]> {
+): Promise<{ items: any[]; rawHitCount: number }> {
   const searchTerm = nyaaQuery ?? query;
   const params = new URLSearchParams({
     page: "rss",
@@ -248,7 +269,7 @@ async function searchNyaa(
   logger.info(
     `Nyaa: ${deduped.length} items after filter+dedup (from ${itemList.length} raw)`,
   );
-  return deduped;
+  return { items: deduped, rawHitCount: itemList.length };
 }
 
 // --- EZTV ---
@@ -384,16 +405,17 @@ async function searchEztv(
   preferGroup?: string,
   preferCodec?: string,
   // deno-lint-ignore no-explicit-any
-): Promise<any[]> {
-  const items = await fetchEztvFeed(logger, eztvUrl);
-  return matchEztvItems(
-    items,
+): Promise<{ items: any[]; rawHitCount: number }> {
+  const feedItems = await fetchEztvFeed(logger, eztvUrl);
+  const items = matchEztvItems(
+    feedItems,
     query,
     resolution,
     logger,
     preferGroup,
     preferCodec,
   );
+  return { items, rawHitCount: feedItems.length };
 }
 
 // --- Newznab (usenet indexers like althub, nzbgeek, etc.) ---
@@ -408,7 +430,7 @@ async function searchNewznab(
   category?: string,
   searchType?: "tvsearch" | "search" | "movie",
   // deno-lint-ignore no-explicit-any
-): Promise<any[]> {
+): Promise<{ items: any[]; rawHitCount: number }> {
   // Default to general `search` so movies, TV, and uncategorized releases all
   // come back. Callers can narrow with searchType=tvsearch (cat 5040 default)
   // or searchType=movie (cat 2040 default).
@@ -519,14 +541,14 @@ async function searchNewznab(
   logger.info(
     `Newznab: ${deduped.length} items for "${query}" at ${normalizedRes}p (from ${items.length} raw)`,
   );
-  return deduped;
+  return { items: deduped, rawHitCount: items.length };
 }
 
 // --- Model ---
 
 export const model = {
   type: "@keeb/mms/source",
-  version: "2026.05.08.1",
+  version: "2026.07.09.1",
   reports: ["@keeb/mms/discovery-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -633,6 +655,18 @@ export const model = {
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
+    {
+      fromVersion: "2026.05.08.1",
+      toVersion: "2026.07.09.1",
+      description:
+        "Add a provenance envelope to the `episodes` resource from the " +
+        "`search` method: queryEcho (effective query sent), rawHitCount " +
+        "(provider items before filtering), providerStatus. Lets a consumer " +
+        "tell a trustworthy empty (providerStatus 'ok', rawHitCount 0) from " +
+        "an over-filtered or failed one. globalArguments unchanged.",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
   ],
   resources: {
     episodes: {
@@ -696,39 +730,68 @@ export const model = {
         // deno-lint-ignore no-explicit-any
         context: any,
       ) => {
-        const items = args.provider === "subsplease"
-          ? await searchSubsPlease(args.query, args.resolution, context.logger)
-          : args.provider === "eztv"
-          ? await searchEztv(
-            args.query,
-            args.resolution,
-            context.logger,
-            args.eztvUrl,
-            args.preferGroup,
-            args.preferCodec,
-          )
-          : args.provider === "newznab"
-          ? await searchNewznab(
-            args.query,
-            args.resolution,
-            args.newznabUrl!,
-            args.newznabApiKey!,
-            context.logger,
-            args.newznabCat,
-            args.newznabSearchType,
-          )
-          : await searchNyaa(
-            args.query,
-            args.resolution,
-            context.logger,
-            args.nyaaUser,
-            args.nyaaQuery,
+        // deno-lint-ignore no-explicit-any
+        let items: any[] = [];
+        let rawHitCount = 0;
+        let providerStatus = "ok";
+        // Echo the query actually sent so a consumer can tell an empty result
+        // apart from a query that never reached the provider. Only nyaa
+        // rewrites the query (nyaaQuery override); the rest search verbatim.
+        const queryEcho = args.provider === "nyaa"
+          ? (args.nyaaQuery ?? args.query)
+          : args.query;
+        try {
+          const result = args.provider === "subsplease"
+            ? await searchSubsPlease(
+              args.query,
+              args.resolution,
+              context.logger,
+            )
+            : args.provider === "eztv"
+            ? await searchEztv(
+              args.query,
+              args.resolution,
+              context.logger,
+              args.eztvUrl,
+              args.preferGroup,
+              args.preferCodec,
+            )
+            : args.provider === "newznab"
+            ? await searchNewznab(
+              args.query,
+              args.resolution,
+              args.newznabUrl!,
+              args.newznabApiKey!,
+              context.logger,
+              args.newznabCat,
+              args.newznabSearchType,
+            )
+            : await searchNyaa(
+              args.query,
+              args.resolution,
+              context.logger,
+              args.nyaaUser,
+              args.nyaaQuery,
+            );
+          items = result.items;
+          rawHitCount = result.rawHitCount;
+        } catch (err) {
+          // Don't throw: a provider failure must surface as a legible
+          // non-answer (empty episodes + providerStatus=error), not a crash a
+          // consumer could misread as "nothing is carried".
+          providerStatus = err instanceof Error ? err.message : String(err);
+          context.logger.error(
+            `search failed for "${args.query}" on ${args.provider}: ${providerStatus}`,
           );
+        }
 
         const handle = await context.writeResource("episodes", "current", {
           episodes: items,
           count: items.length,
           timestamp: new Date().toISOString(),
+          queryEcho,
+          rawHitCount,
+          providerStatus,
         });
         return { dataHandles: [handle] };
       },
@@ -782,13 +845,13 @@ export const model = {
                 show.preferCodec,
               );
             } else if (show.provider === "subsplease") {
-              items = await searchSubsPlease(
+              items = (await searchSubsPlease(
                 show.name,
                 show.resolution ?? "1080",
                 context.logger,
-              );
+              )).items;
             } else if (show.provider === "newznab") {
-              items = await searchNewznab(
+              items = (await searchNewznab(
                 show.name,
                 show.resolution ?? "1080",
                 show.newznabUrl!,
@@ -796,15 +859,15 @@ export const model = {
                 context.logger,
                 show.newznabCat,
                 show.newznabSearchType,
-              );
+              )).items;
             } else if (show.provider === "nyaa") {
-              items = await searchNyaa(
+              items = (await searchNyaa(
                 show.name,
                 show.resolution ?? "1080",
                 context.logger,
                 show.nyaaUser,
                 show.nyaaQuery,
-              );
+              )).items;
             } else {
               continue;
             }

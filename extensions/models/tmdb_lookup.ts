@@ -89,6 +89,11 @@ export const model = {
         "Add searchMovie method and movie resource; no globalArgs change",
       upgradeAttributes: (old) => old,
     },
+    {
+      toVersion: "2026.07.03.1",
+      description: "Add seasons method; no schema or globalArgs change",
+      upgradeAttributes: (old) => old,
+    },
   ],
   resources: {
     show: {

@@ -1,6 +1,9 @@
 // rottentomatoes-scraper.ts — called by the swamp rottentomatoes model via Deno.Command.
 // Invoked as: node rottentomatoes-scraper.ts <method> <headless> [argsJson]
-//   argsJson: { sort: "newest" | "popular", loadMoreClicks?: number }
+//   browse:        { sort: "newest" | "popular", loadMoreClicks?: number }
+//   browse_movies: { list: "at_home" | "in_theaters" | "coming_soon",
+//                    sort: "popular" | "newest" | "critic_highest" | "audience_highest",
+//                    loadMoreClicks?: number }
 // Outputs JSON to stdout; progress/errors to stderr.
 //
 // Runs under Node (not Deno) because Playwright is the canonical browser
@@ -10,7 +13,7 @@
 // import below is parsed as ESM.
 
 // Resolve playwright via CJS createRequire so NODE_PATH (set by the swamp model
-// to the consumer repo's node_modules) is honored. ESM resolution does not
+// to its cached playwright install, or a configured node_modules) is honored. ESM resolution does not
 // consult NODE_PATH, which would break when this script ships inside the
 // extension bundle rather than alongside a node_modules tree.
 import { createRequire } from "node:module";
@@ -31,6 +34,39 @@ const SORT_URLS: Record<string, string> = {
     "https://www.rottentomatoes.com/browse/tv_series_browse/sort:popular",
 };
 
+// RT splits movies into three browse categories rather than one list. "at_home"
+// is the streaming/VOD shelf — the only one that answers "what can we watch
+// tonight" — so it's the default the model exposes.
+const MOVIE_LIST_PATHS: Record<string, string> = {
+  at_home: "movies_at_home",
+  in_theaters: "movies_in_theaters",
+  coming_soon: "movies_coming_soon",
+};
+
+const MOVIE_SORTS = [
+  "popular",
+  "newest",
+  "critic_highest",
+  "audience_highest",
+] as const;
+
+function movieUrl(list: string, sort: string): string {
+  const path = MOVIE_LIST_PATHS[list];
+  if (!path) {
+    throw new Error(
+      `Unknown movie list: ${list}. Use one of: ${
+        Object.keys(MOVIE_LIST_PATHS).join(", ")
+      }`,
+    );
+  }
+  if (!(MOVIE_SORTS as readonly string[]).includes(sort)) {
+    throw new Error(
+      `Unknown movie sort: ${sort}. Use one of: ${MOVIE_SORTS.join(", ")}`,
+    );
+  }
+  return `https://www.rottentomatoes.com/browse/${path}/sort:${sort}`;
+}
+
 async function clickLoadMoreIfPresent(page: Page): Promise<boolean> {
   return await page.evaluate(() => {
     const candidates = Array.from(document.querySelectorAll("button, a"));
@@ -44,11 +80,12 @@ async function clickLoadMoreIfPresent(page: Page): Promise<boolean> {
   });
 }
 
-async function extractTiles(page: Page) {
-  return await page.evaluate(() => {
+// prefix is the RT href namespace for the media type: "/tv/" or "/m/".
+async function extractTiles(page: Page, prefix: string) {
+  return await page.evaluate((prefix: string) => {
     const tiles = Array.from(
       document.querySelectorAll(
-        "a[data-qa='discovery-media-list-item-caption'], a[href^='/tv/']",
+        `a[data-qa='discovery-media-list-item-caption'], a[href^='${prefix}']`,
       ),
     );
     const byHref = new Map<
@@ -62,9 +99,11 @@ async function extractTiles(page: Page) {
         popcornScore: number | null;
       }
     >();
+    const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const hrefPattern = new RegExp(`^${escaped}[^/]+$`);
     for (const a of tiles) {
       const href = (a.getAttribute("href") || "").replace(/\/$/, "");
-      if (!/^\/tv\/[^/]+$/.test(href)) continue;
+      if (!hrefPattern.test(href)) continue;
       if (byHref.has(href)) continue;
 
       const raw = (a.textContent || "").replace(/ /g, " ");
@@ -119,13 +158,13 @@ async function extractTiles(page: Page) {
       const yearMatch = href.match(/_(\d{4})\/?$/);
       if (yearMatch) year = parseInt(yearMatch[1], 10);
 
-      const slug = href.replace(/^\/tv\//, "").replace(/\/$/, "");
+      const slug = href.slice(prefix.length).replace(/\/$/, "");
       const url = `https://www.rottentomatoes.com${href}`;
 
       byHref.set(href, { title, year, slug, url, tomatoScore, popcornScore });
     }
     return Array.from(byHref.values());
-  });
+  }, prefix);
 }
 
 async function browse(
@@ -139,9 +178,40 @@ async function browse(
       `Unknown sort: ${sort}. Use one of: ${Object.keys(SORT_URLS).join(", ")}`,
     );
   }
+  const items = await scrapeList(
+    headless,
+    url,
+    "/tv/",
+    args.loadMoreClicks ?? 0,
+    `sort=${sort}`,
+  );
+  return { sort, collectedAt: new Date().toISOString(), items };
+}
 
-  const loadMoreClicks = args.loadMoreClicks ?? 0;
+async function browseMovies(
+  headless: string,
+  args: { list?: string; sort?: string; loadMoreClicks?: number },
+) {
+  const list = args.list || "at_home";
+  const sort = args.sort || "popular";
+  const url = movieUrl(list, sort);
+  const items = await scrapeList(
+    headless,
+    url,
+    "/m/",
+    args.loadMoreClicks ?? 0,
+    `list=${list} sort=${sort}`,
+  );
+  return { list, sort, collectedAt: new Date().toISOString(), items };
+}
 
+async function scrapeList(
+  headless: string,
+  url: string,
+  prefix: string,
+  loadMoreClicks: number,
+  logLabel: string,
+) {
   const browser = await chromium.launch({
     headless: headless === "true" || headless === true as unknown as string,
   });
@@ -154,10 +224,10 @@ async function browse(
 
   try {
     process.stderr.write(
-      `[rt/browse] sort=${sort} loadMoreClicks=${loadMoreClicks}\n`,
+      `[rt/browse] ${logLabel} loadMoreClicks=${loadMoreClicks}\n`,
     );
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForSelector("a[href^='/tv/']", {
+    await page.waitForSelector(`a[href^='${prefix}']`, {
       state: "attached",
       timeout: 30000,
     });
@@ -176,9 +246,9 @@ async function browse(
       await randomDelay(1500, 2800);
     }
 
-    const items = await extractTiles(page);
+    const items = await extractTiles(page, prefix);
     process.stderr.write(`[rt/browse] extracted ${items.length} tiles\n`);
-    return { sort, collectedAt: new Date().toISOString(), items };
+    return items;
   } finally {
     await context.close();
     await browser.close();
@@ -198,6 +268,9 @@ async function main() {
   switch (method) {
     case "browse":
       result = await browse(headless, args);
+      break;
+    case "browse_movies":
+      result = await browseMovies(headless, args);
       break;
     default:
       process.stderr.write(`Unknown method: ${method}\n`);

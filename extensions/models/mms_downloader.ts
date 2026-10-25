@@ -1,4 +1,5 @@
 import { z } from "npm:zod@4";
+import { newest } from "./_lib/latest.ts";
 
 // --- Transmission RPC helpers ---
 
@@ -367,7 +368,7 @@ export const model = {
           );
         }
         // deno-lint-ignore no-explicit-any
-        const episodes: any[] = records[0].attributes.episodes ?? [];
+        const episodes: any[] = newest(records)!.attributes.episodes ?? [];
         // deno-lint-ignore no-explicit-any
         const ep = episodes.find((e: any) => e.rawTitle === args.rawTitle);
         if (!ep || !ep.infoHash) {
@@ -493,7 +494,7 @@ export const model = {
           return { dataHandles: [handle] };
         }
         // deno-lint-ignore no-explicit-any
-        const episodes: any[] = records[0].attributes.episodes ?? [];
+        const episodes: any[] = newest(records)!.attributes.episodes ?? [];
         if (episodes.length === 0) {
           context.logger.info(
             `Source "${args.sourceModel}" batch is empty`,

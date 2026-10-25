@@ -2,7 +2,7 @@ import { z } from "npm:zod@4";
 import { MongoClient } from "npm:mongodb@6.12.0";
 import { ollamaGenerate } from "./_lib/ollama.ts";
 
-// Prompts loaded at runtime from prompts/ via context.repoDir
+// Prompts loaded at runtime from the bundled prompts/ via context.extensionFile
 
 // --- Video file detection ---
 
@@ -62,6 +62,40 @@ const GlobalArgsSchema = z.object({
     .describe("Root of the organized media tree (e.g. /home/keeb/media)"),
 });
 
+const PlaylistSchema = z.object({
+  dir: z.string().describe("Directory the playlist covers"),
+  path: z.string().describe("Path of the written .m3u file"),
+  entries: z.number().describe("Number of video files in the playlist"),
+  episodes: z
+    .array(z.string())
+    .describe("Playlist entries, in play order, relative to dir"),
+  status: z
+    .enum(["written", "unchanged", "empty"])
+    .describe("Result: unchanged means content already matched on disk"),
+  writtenAt: z.iso.datetime(),
+});
+
+type Playlist = z.infer<typeof PlaylistSchema>;
+
+// One resource per run rather than one per .m3u — a playlist is fully derived
+// from its directory, so the interesting identity is "which run touched what",
+// not the playlist itself. Instance name is stable per target so version
+// history reads as that target's regeneration history.
+const PlaylistRunSchema = z.object({
+  scope: z
+    .string()
+    .describe("What the run covered: a path, or the recent-jobs window"),
+  dirs: z.number().describe("Directories considered"),
+  written: z.number().describe("Playlists written or rewritten"),
+  unchanged: z.number().describe("Playlists already up to date"),
+  failed: z.number().describe("Directories that errored"),
+  results: z.array(PlaylistSchema).describe("Per-directory results"),
+  failures: z
+    .array(z.object({ dir: z.string(), error: z.string() }))
+    .describe("Per-directory failures, captured rather than aborting the run"),
+  ranAt: z.iso.datetime(),
+});
+
 const JobSchema = z.object({
   jobId: z.string().describe("MongoDB document _id"),
   filename: z.string().describe("Original filename from the job"),
@@ -83,12 +117,18 @@ const JobSchema = z.object({
 
 export const model = {
   type: "@keeb/mms/organizer",
-  version: "2026.07.03.1",
+  version: "2026.08.16.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     job: {
       description: "Processed media job result",
       schema: JobSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    playlist_run: {
+      description: "Playlist (.m3u) generation run summary",
+      schema: PlaylistRunSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,
     },
@@ -116,13 +156,13 @@ export const model = {
 
         // Load prompts from canonical files
         const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/filename-to-json.prompt`,
+          context.extensionFile("prompts/filename-to-json.md"),
         );
         const ANIME_FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/anime-filename-to-json.prompt`,
+          context.extensionFile("prompts/anime-filename-to-json.md"),
         );
         const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/json-to-save-path.prompt`,
+          context.extensionFile("prompts/json-to-save-path.md"),
         );
 
         // Health check Ollama before popping any jobs
@@ -385,13 +425,13 @@ export const model = {
 
         const isAnime = isAnimeByReleaseGroup(args.filename);
         const stage1PromptName = isAnime
-          ? "anime-filename-to-json.prompt"
-          : "filename-to-json.prompt";
+          ? "anime-filename-to-json.md"
+          : "filename-to-json.md";
         const FILENAME_TO_JSON_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/${stage1PromptName}`,
+          context.extensionFile(`prompts/${stage1PromptName}`),
         );
         const JSON_TO_SAVE_PATH_PROMPT = await Deno.readTextFile(
-          `${context.repoDir}/prompts/json-to-save-path.prompt`,
+          context.extensionFile("prompts/json-to-save-path.md"),
         );
         context.logger.info(
           `Stage 1 prompt: ${stage1PromptName}${
@@ -544,8 +584,292 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+    write_playlists: {
+      description:
+        "Write an .m3u playlist of every video file, in episode order, into a catalog directory (and optionally its subdirectories)",
+      arguments: z.object({
+        path: z
+          .string()
+          .describe(
+            "Directory to generate for, e.g. .../shows/from/s1. With recursive, a subtree root like .../shows",
+          ),
+        recursive: z
+          .boolean()
+          .default(false)
+          .describe("Walk subdirectories and generate a playlist in each"),
+      }),
+      execute: async (
+        args: { path: string; recursive: boolean },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const { mediaRoot } = context.globalArgs;
+        const root = args.path.replace(/\/+$/, "");
+
+        const dirs = args.recursive
+          ? await collectDirs(root, mediaRoot)
+          : isPlaylistDir(root, mediaRoot)
+          ? [root]
+          : [];
+        if (dirs.length === 0) {
+          context.logger.warn(
+            `No playlist-eligible directory under ${root} ` +
+              `(category roots and staging are skipped by design)`,
+          );
+        }
+
+        const handle = await runPlaylists(
+          dirs,
+          args.recursive ? `${root} (recursive)` : root,
+          instanceName(root),
+          context,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    write_playlists_recent: {
+      description:
+        "Regenerate .m3u playlists for every directory touched by recent organizer jobs",
+      arguments: z.object({
+        windowMinutes: z
+          .number()
+          .default(60)
+          .describe("Look at organizer jobs processed in the last N minutes"),
+      }),
+      execute: async (
+        args: { windowMinutes: number },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
+        const { mediaRoot } = context.globalArgs;
+        const cutoff = new Date(
+          Date.now() - args.windowMinutes * 60 * 1000,
+        ).toISOString();
+        const predicate = `modelName == "${context.definition.name}" && ` +
+          `specName == "job" && attributes.status == "processed" && ` +
+          `attributes.processedAt > "${cutoff}"`;
+        const records = await context.queryData(predicate);
+
+        // Many jobs land in the same season directory; a playlist is derived
+        // from the whole directory, so one regeneration per distinct dir is
+        // enough regardless of how many episodes arrived.
+        const dirs: string[] = [];
+        const seen = new Set<string>();
+        for (const rec of records) {
+          // deno-lint-ignore no-explicit-any
+          const destPath: string | undefined = (rec as any).attributes
+            ?.destPath;
+          if (!destPath) continue;
+          const dir = destPath.replace(/\/+$/, "");
+          if (seen.has(dir)) continue;
+          seen.add(dir);
+          if (!isPlaylistDir(dir, mediaRoot)) {
+            context.logger.info(`Skipping non-show directory: ${dir}`);
+            continue;
+          }
+          dirs.push(dir);
+        }
+        context.logger.info(
+          `${records.length} job(s) since ${cutoff} → ${dirs.length} directory(s)`,
+        );
+
+        const handle = await runPlaylists(
+          dirs,
+          `organizer jobs since ${cutoff}`,
+          "recent",
+          context,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
   },
 };
+
+// --- Playlist generation ---
+
+// A playlist belongs to a season directory (shows/<slug>/s<N>) or a flat anime
+// directory (anime/completed/<slug>) — never to a category root like movies/,
+// which would collapse the entire library into one file.
+const CONTAINER_DIRS = new Set(["anime/completed"]);
+
+function isPlaylistDir(dir: string, mediaRoot: string): boolean {
+  const videoRoot = `${mediaRoot.replace(/\/+$/, "")}/video`;
+  if (!dir.startsWith(`${videoRoot}/`)) return false;
+  const rel = dir.slice(videoRoot.length + 1).replace(/\/+$/, "");
+  const segments = rel.split("/").filter(Boolean);
+  // One segment is a category root (shows/, movies/, anime/).
+  if (segments.length < 2) return false;
+  if (segments[0] === "staging") return false;
+  return !CONTAINER_DIRS.has(rel);
+}
+
+// Walk a subtree collecting every playlist-eligible directory. Used for
+// backfills over an existing catalog.
+async function collectDirs(
+  root: string,
+  mediaRoot: string,
+): Promise<string[]> {
+  const found: string[] = [];
+  if (isPlaylistDir(root, mediaRoot)) found.push(root);
+  for await (const entry of Deno.readDir(root)) {
+    if (!entry.isDirectory) continue;
+    found.push(...await collectDirs(`${root}/${entry.name}`, mediaRoot));
+  }
+  return found;
+}
+
+// Episode number is the only ordering signal that survives mixed release
+// groups in one directory ([SubsPlease] ... - 07 alongside [DKB] ... S01E07).
+// Season is a tiebreaker only when EVERY entry carries one — otherwise
+// seasonless anime releases would sort as a phantom season 0 ahead of their
+// own SxxEyy-named siblings.
+function parseOrder(
+  filename: string,
+): { season?: number; episode: number } | null {
+  const parsed = regexParseFilename(filename);
+  if (!parsed?.episode) return null;
+  const episode = parseInt(parsed.episode);
+  if (!Number.isFinite(episode)) return null;
+  const season = parsed.season ? parseInt(parsed.season) : undefined;
+  return { season, episode };
+}
+
+function naturalCompare(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+}
+
+function sortEpisodes(files: string[]): string[] {
+  const keys = new Map(files.map((f) => [f, parseOrder(f)]));
+  const parsed = [...keys.values()].filter((k) => k != null);
+  const useSeason = parsed.length > 0 &&
+    parsed.every((k) => k!.season != null);
+
+  return [...files].sort((a, b) => {
+    const ka = keys.get(a) ?? null;
+    const kb = keys.get(b) ?? null;
+    // Unparseable names (extras, specials, oddly-named rips) sort last rather
+    // than silently landing between episodes.
+    if (!ka && !kb) return naturalCompare(a, b);
+    if (!ka) return 1;
+    if (!kb) return -1;
+    if (useSeason && ka.season !== kb.season) {
+      return (ka.season ?? 0) - (kb.season ?? 0);
+    }
+    if (ka.episode !== kb.episode) return ka.episode - kb.episode;
+    return naturalCompare(a, b);
+  });
+}
+
+// The playlist is named after its own directory (s1/ → s1.m3u), so it stays
+// meaningful once Jellyfin or a player shows it detached from its path.
+async function writePlaylist(
+  dir: string,
+  // deno-lint-ignore no-explicit-any
+  logger: any,
+): Promise<Playlist> {
+  const files: string[] = [];
+  for await (const entry of Deno.readDir(dir)) {
+    if (entry.isFile && isVideoFile(entry.name)) files.push(entry.name);
+  }
+
+  const name = `${dir.slice(dir.lastIndexOf("/") + 1)}.m3u`;
+  const path = `${dir}/${name}`;
+  const now = new Date().toISOString();
+
+  if (files.length === 0) {
+    logger.info(`No video files in ${dir}, skipping playlist`);
+    return {
+      dir,
+      path,
+      entries: 0,
+      episodes: [],
+      status: "empty" as const,
+      writtenAt: now,
+    };
+  }
+
+  const episodes = sortEpisodes(files);
+  // Relative entries — the playlist sits beside the media, so it survives the
+  // catalog being mounted at a different prefix by a player or another host.
+  const content = `#EXTM3U\n${episodes.join("\n")}\n`;
+
+  let existing: string | null = null;
+  try {
+    existing = await Deno.readTextFile(path);
+  } catch {
+    // No playlist yet.
+  }
+  if (existing === content) {
+    return {
+      dir,
+      path,
+      entries: episodes.length,
+      episodes,
+      status: "unchanged" as const,
+      writtenAt: now,
+    };
+  }
+
+  await Deno.writeTextFile(path, content);
+  logger.info(`Wrote ${path} (${episodes.length} entries)`);
+  return {
+    dir,
+    path,
+    entries: episodes.length,
+    episodes,
+    status: "written" as const,
+    writtenAt: now,
+  };
+}
+
+async function runPlaylists(
+  dirs: string[],
+  scope: string,
+  instance: string,
+  // deno-lint-ignore no-explicit-any
+  context: any,
+  // deno-lint-ignore no-explicit-any
+): Promise<any> {
+  const results: Playlist[] = [];
+  const failures: { dir: string; error: string }[] = [];
+  for (const dir of dirs) {
+    try {
+      results.push(await writePlaylist(dir, context.logger));
+    } catch (err) {
+      // A directory that vanished or is unreadable shouldn't abort the batch.
+      context.logger.warn(`Skip ${dir}: ${err}`);
+      failures.push({ dir, error: String(err) });
+    }
+  }
+
+  const written = results.filter((r) => r.status === "written").length;
+  const unchanged = results.filter((r) => r.status === "unchanged").length;
+  context.logger.info(
+    `Playlists: ${written} written, ${unchanged} unchanged, ` +
+      `${failures.length} failed across ${dirs.length} directory(s)`,
+  );
+
+  return await context.writeResource("playlist_run", instance, {
+    scope,
+    dirs: dirs.length,
+    written,
+    unchanged,
+    failed: failures.length,
+    results,
+    failures,
+    ranAt: new Date().toISOString(),
+  });
+}
+
+// Stable instance name keyed on a path so re-runs against the same target
+// version one resource rather than creating a new instance per run.
+function instanceName(path: string): string {
+  return path
+    .replace(/^\/+/, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 200);
+}
 
 // --- Regex filename parser (mirrors mms_dedup fast-path) ---
 
@@ -618,7 +942,7 @@ const ANIME_RELEASE_GROUP_RE = new RegExp(
 
 // Patterns that require LLM-driven title remapping or complex season
 // extraction that plain regex can't do. Fall through to the LLM when any
-// match — these are the special cases enumerated in json-to-save-path.prompt.
+// match — these are the special cases enumerated in json-to-save-path.md.
 const LLM_REMAP_TRIGGERS = [
   /yofukashi no uta/i, // → call-of-the-night
   /shimetsu kaiyuu/i, // Jujutsu Kaisen subtitle → season 3

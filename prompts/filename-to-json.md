@@ -22,6 +22,16 @@ Return JSON with these fields:
 **TV Show**: Standard S##E## or #x## patterns, Western show names
 **Book**: Comic book archives (.cbz, .cbr), manga, graphic novels, often numbered volumes
 
+## Release Group Override (HIGHEST PRIORITY)
+If the filename begins with any of these release group tags, `media_type` is ALWAYS `anime`, regardless of title language or season markers:
+- `[SubsPlease]`
+- `[Erai-raws]`
+- `[Judas]` (any case: `[JUDAS]`, `[judas]`)
+- `[EMBER]`
+- `[ASW]`
+
+This rule overrides everything else. "Western-sounding" titles like "Dr. Stone" or "Shadows House" are still anime when released by these groups.
+
 ## Common Patterns
 - TV: `Show.Name.S01E01.Episode.Title.ext`
 - Anime: `Anime Title - 01 [1080p].mkv` or `Anime.Title.E01.ext`
@@ -55,7 +65,5 @@ Output: `{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 3, "episod
 
 Input: `[Erai-raws] Jujutsu Kaisen 2nd Season - 23 [1080p]`
 Output: `{"media_type": "anime", "title": "Jujutsu Kaisen", "season": 2, "episode": 23, "episode_title": null, "year": null, "confidence": "High"}`
-
-- "Hokuto no Ken (2026) (Fist of the North Star)" → title: "Hokuto no Ken", year: 2026
 
 Parse the filename and return only the JSON response.
