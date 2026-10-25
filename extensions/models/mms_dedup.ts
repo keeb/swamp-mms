@@ -65,6 +65,25 @@ export function slugDir(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+// Re-releases carry a version suffix ("01v2", "09 V2"). Disk checks use the
+// base episode — any version on disk counts as having it — and the version
+// only breaks ties between candidates for the same episode.
+export function splitVersion(
+  episode: string,
+): { base: string; version: number } {
+  const m = episode.match(/^(.*?\d)\s*v(\d+)$/i);
+  return m
+    ? { base: m[1], version: Number(m[2]) }
+    : { base: episode, version: 1 };
+}
+
+// A season the release title states outright (SxxEyy), as opposed to one the
+// LLM inferred. Only this kind is trusted to make the disk check strict.
+export function explicitSeason(rawTitle: string | undefined): string | null {
+  const m = rawTitle?.match(/\bS(\d{1,3})E\d{1,4}/i);
+  return m ? String(parseInt(m[1])) : null;
+}
+
 async function buildFileIndex(
   dirs: string[],
   // deno-lint-ignore no-explicit-any
@@ -103,7 +122,10 @@ export function fileExistsInIndex(
   // deno-lint-ignore no-explicit-any
   logger: any,
 ): boolean {
-  const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
+  const epPadded = splitVersion(episode).base.replace(/^0+/, "").padStart(
+    2,
+    "0",
+  );
   const normalizedShow = normalize(show);
   const epPattern = new RegExp(
     `[\\s\\-_\\.E]0?${escapeRegex(epPadded)}[\\s\\.\\[\\(v\\-]`,
@@ -141,7 +163,10 @@ export function fileExistsInDest(
   const slugMarker = `/${slug}/`;
   const normalizedSlug = normalize(slug);
 
-  const epPadded = episode.replace(/^0+/, "").padStart(2, "0");
+  const epPadded = splitVersion(episode).base.replace(/^0+/, "").padStart(
+    2,
+    "0",
+  );
   const seasonPadded = season
     ? String(parseInt(season)).padStart(2, "0")
     : null;
@@ -179,10 +204,16 @@ export function fileExistsInDest(
   return false;
 }
 
-// Keep one candidate per show+season+episode. Preference order:
-// MeGusta > HEVC/x265 > first seen.
+// Keep one candidate per show+season+episode (version suffix ignored, so
+// "49" and "49v2" collapse). Preference order: MeGusta > HEVC/x265 > higher
+// version > first seen.
 export function pickPreferred<
-  T extends { _show: string; _season?: string; _episode: string; _rawTitle?: string },
+  T extends {
+    _show: string;
+    _season?: string;
+    _episode: string;
+    _rawTitle?: string;
+  },
 >(handles: T[]): T[] {
   const releaseScore = (title: string) =>
     (title.includes("MeGusta") ? 10 : 0) +
@@ -190,11 +221,20 @@ export function pickPreferred<
 
   const byEpisode = new Map<string, T>();
   for (const h of handles) {
-    const key = slugDir(`${h._show}-s${h._season ?? "0"}-e${h._episode}`);
+    const { base } = splitVersion(h._episode);
+    const key = slugDir(`${h._show}-s${h._season ?? "0"}-e${base}`);
     const existing = byEpisode.get(key);
+    if (!existing) {
+      byEpisode.set(key, h);
+      continue;
+    }
+    const score = releaseScore(h._rawTitle ?? "");
+    const existingScore = releaseScore(existing._rawTitle ?? "");
     if (
-      !existing ||
-      releaseScore(h._rawTitle ?? "") > releaseScore(existing._rawTitle ?? "")
+      score > existingScore ||
+      (score === existingScore &&
+        splitVersion(h._episode).version >
+          splitVersion(existing._episode).version)
     ) {
       byEpisode.set(key, h);
     }
@@ -206,7 +246,7 @@ export function pickPreferred<
 
 export const model = {
   type: "@keeb/mms/dedup",
-  version: "2026.05.08.1",
+  version: "2026.10.23.1",
   reports: ["@keeb/mms/dedup-summary"],
   globalArguments: GlobalArgsSchema,
   upgrades: [
@@ -254,6 +294,16 @@ export const model = {
         "the slug and synthesize destPath instead of running LLM stage 2. " +
         "Fixes mismatch where the torrent's display title and the catalog " +
         "directory diverge (e.g. Judas releases).",
+      // deno-lint-ignore no-explicit-any
+      upgradeAttributes: (old: any) => old,
+    },
+    {
+      fromVersion: "2026.05.08.1",
+      toVersion: "2026.10.23.1",
+      description:
+        "Ignore version suffixes (01v2) when checking disk and when picking " +
+        "one candidate per episode; strict season match when the release " +
+        "title states SxxEyy, so a sequel's E04 isn't satisfied by S01E04.",
       // deno-lint-ignore no-explicit-any
       upgradeAttributes: (old: any) => old,
     },
@@ -436,13 +486,20 @@ export const model = {
           if (destPath) {
             // Nyaa items: check disk under the canonical destPath the
             // organizer would write to. Consistent with on-disk dir naming.
+            // Strict when the season is authoritative: a structured source,
+            // or a release title that states SxxEyy itself (so S04E04 can't
+            // be satisfied by the S01E04 already in the show dir). An
+            // LLM-inferred season alone stays lenient.
+            const titleSeason = explicitSeason(data.rawTitle);
+            const seasonStated = titleSeason != null && season != null &&
+              titleSeason === String(parseInt(season));
             exists = fileExistsInDest(
               destPath,
               season,
               episode,
               fileIndex,
               context.logger,
-              { strictSeason: structured },
+              { strictSeason: structured || seasonStated },
             );
           } else {
             // SubsPlease items: trust source-provided show name; substring
