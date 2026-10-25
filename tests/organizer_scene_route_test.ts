@@ -73,13 +73,55 @@ Deno.test("scene route: defers when unsure", async () => {
   const root = await catalog();
   const dirs = await listCatalogDirs(root);
   assertEquals(sceneRoute(ep({ confidence: "medium" }), dirs, root), null);
-  assertEquals(sceneRoute(ep({ title: "Brand New Show" }), dirs, root), null);
   assertEquals(
     sceneRoute(ep({ kind: "special", season: 0 }), dirs, root),
     null,
   );
   assertEquals(sceneRoute(ep({ title: "Dupe", season: 1 }), dirs, root), null);
   assertEquals(sceneRoute(ep({ style: "fansub" }), dirs, root), null);
+});
+
+Deno.test("scene route: a new show gets shows/<slug>/sN", async () => {
+  const root = await catalog();
+  const dirs = await listCatalogDirs(root);
+  const c = sceneRoute(ep({ title: "Carrie", season: 1 }), dirs, root);
+  assertEquals(
+    [c?.destPath, c?.mediaType],
+    [`${root}/video/shows/carrie/s1`, "tv_show"],
+  );
+  // year dropped like lioness; filler words don't make it look like a known show
+  assertEquals(
+    sceneRoute(
+      ep({ title: "Interview with the Vampire", year: 2022, season: 3 }),
+      [...dirs, `${root}/video/shows/whats-next-the-future-with-bill-gates`],
+      root,
+    )?.destPath,
+    `${root}/video/shows/interview-with-the-vampire/s3`,
+  );
+  // anime / remap releases keep the LLM
+  assertEquals(
+    sceneRoute(ep({ title: "Carrie", season: 1 }), dirs, root, false),
+    null,
+  );
+});
+
+Deno.test("scene route: a new show that looks like a known one defers", async () => {
+  const root = await catalog();
+  const dirs = await listCatalogDirs(root);
+  // a prefix of / extension of an existing dir
+  assertEquals(
+    sceneRoute(ep({ title: "Lioness Origins", season: 1 }), dirs, root),
+    null,
+  );
+  // every word of an existing dir's name
+  assertEquals(
+    sceneRoute(ep({ title: "The Lioness", season: 1 }), dirs, root),
+    null,
+  );
+  assertEquals(
+    sceneRoute(ep({ title: "Office Ladies", season: 1 }), dirs, root),
+    null,
+  );
 });
 
 Deno.test("scene route: features with a year go to movies", async () => {

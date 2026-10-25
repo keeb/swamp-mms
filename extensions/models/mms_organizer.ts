@@ -584,7 +584,10 @@ export const model = {
           mediaRoot,
         } = context.globalArgs;
         const prompts = await loadPrompts(context);
-        await ollamaHealthCheck(ollamaUrl);
+        // Only when a file actually needs the LLM: an all-deterministic plan
+        // doesn't depend on Ollama being up.
+        let health: Promise<void> | undefined;
+        const beforeLlm = () => (health ??= ollamaHealthCheck(ollamaUrl));
         const catalogDirs = await listCatalogDirs(mediaRoot);
         const hash = await rulesHash(prompts, ollamaModel);
         const scene = new Map(
@@ -623,6 +626,7 @@ export const model = {
                   structured: true,
                   catalogDirs,
                   scene,
+                  beforeLlm,
                 });
                 const g = await gateContext(c.destPath, catalogDirs);
                 const judgeKey = c.route === "llm"
@@ -1025,9 +1029,15 @@ export const model = {
         "Dry-run classification: parse a filename and show where it would be organized without moving anything",
       arguments: z.object({
         filename: z.string().describe("Filename to classify"),
+        scene: z.array(SceneItemSchema).default([]).describe(
+          "@keeb/scenerules parse items (as plan takes them); enables the scene route",
+        ),
       }),
-      // deno-lint-ignore no-explicit-any
-      execute: async (args: { filename: string }, context: any) => {
+      execute: async (
+        args: { filename: string; scene: z.infer<typeof SceneItemSchema>[] },
+        // deno-lint-ignore no-explicit-any
+        context: any,
+      ) => {
         const { ollamaModel, ollamaUrl, mediaRoot } = context.globalArgs;
         const prompts: Prompts = {
           filename: await Deno.readTextFile(
@@ -1049,6 +1059,9 @@ export const model = {
           prompts,
           structured: true,
           catalogDirs,
+          scene: new Map(
+            args.scene.map((i) => [String(i.input), i.parsed as SceneParse]),
+          ),
         });
         const g = await gateContext(c.destPath, catalogDirs);
         context.logger.info(
@@ -1659,7 +1672,7 @@ export type SceneParse = {
 };
 
 /** Bumped when the scene route's decisions change (feeds rulesHash). */
-export const SCENE_ROUTE_VERSION = 1;
+export const SCENE_ROUTE_VERSION = 2;
 
 /**
  * Deterministic placement from a scene-rules parse, or null to defer to the
@@ -1669,13 +1682,17 @@ export const SCENE_ROUTE_VERSION = 1;
  *   catalog (shows/ or anime/completed/): the existing dir whose slug matches
  *   the scene title, with the country code kept and a trailing year optional
  *   (Lioness.2023 → lioness). Exactly one dir must match;
+ * - the same for a show not in the catalog yet (unless `allowNew` is false):
+ *   shows/<title[-country]>/sN, as long as no existing dir looks like the
+ *   same show (Survivor.AU next to survivor/ defers);
  * - a feature with a production year: movies/ (flat; anime films too).
- * New shows, specials and anything ambiguous go to the LLM and the gate.
+ * Specials and anything ambiguous go to the LLM and the gate.
  */
 export function sceneRoute(
   p: SceneParse,
   catalogDirs: string[],
   mediaRoot: string,
+  allowNew = true,
 ): { destPath: string; mediaType: string; title: string } | null {
   if (p.confidence !== "high" || !p.title || p.style === "fansub") return null;
   const root = mediaRoot.replace(/\/$/, "");
@@ -1704,7 +1721,19 @@ export function sceneRoute(
     }
     if (hits.length > 1) return null; // same slug in shows/ and anime/: ambiguous
   }
-  return null;
+  // A new show. Anything in the catalog that might be it (a shared distinctive
+  // word, a prefix) goes to the LLM, which gets those dirs as hints.
+  const slug = slugify(base);
+  if (!allowNew || !slug) return null;
+  const near = similarCatalogDirs(base, catalogDirs).some((s) =>
+    s.contained || s.score >= 0.5
+  );
+  if (near) return null;
+  return {
+    destPath: `${root}/video/shows/${slug}/s${p.season}`,
+    mediaType: "tv_show",
+    title: p.title,
+  };
 }
 
 /** Ollama structured-output schema for stage 1 (filename → metadata). */
@@ -1752,6 +1781,16 @@ const STOP_TOKENS = new Set([
   "de",
   "of",
   "and",
+  "with",
+  "an",
+  "in",
+  "on",
+  "at",
+  "for",
+  "from",
+  "by",
+  "or",
+  "vs",
   "season",
   "hen",
 ]);
@@ -1861,6 +1900,8 @@ export type ClassifyOptions = {
   catalogDirs?: string[];
   /** @keeb/scenerules parse results by filename, for the scene route. */
   scene?: Map<string, SceneParse>;
+  /** Runs once before the first LLM call (e.g. an Ollama health check). */
+  beforeLlm?: () => Promise<void>;
 };
 
 /**
@@ -1924,8 +1965,16 @@ export async function classifyFile(
       };
     }
     const sp = opts.scene?.get(filename);
+    // New show dirs only for non-anime releases; anime the fast path deferred
+    // (or that needs a title remap) keeps the LLM.
     const sr = sp && opts.catalogDirs
-      ? sceneRoute(sp, opts.catalogDirs, mediaRoot)
+      ? sceneRoute(
+        sp,
+        opts.catalogDirs,
+        mediaRoot,
+        !isAnimeByReleaseGroup(filename) &&
+          !LLM_REMAP_TRIGGERS.some((re) => re.test(filename)),
+      )
       : null;
     if (sp && sr) {
       return {
@@ -1946,6 +1995,7 @@ export async function classifyFile(
   // Stage 1: filename → JSON metadata. Release-group anime gets the anime
   // prompt — the general prompt loses season/episode on noisy anime filenames
   // (alt titles, year-in-parens) that the fast-path defers.
+  await opts.beforeLlm?.();
   const stage1Prompt = isAnimeByReleaseGroup(filename)
     ? prompts.anime
     : prompts.filename;

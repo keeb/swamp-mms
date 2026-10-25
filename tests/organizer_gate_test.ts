@@ -68,6 +68,14 @@ Deno.test("gateContext: existing dir or a genuinely new show is not a split risk
   );
   assertEquals(fresh.splitRisk, false);
 
+  // Filler words aren't a match at all.
+  assertEquals(
+    similarCatalogDirs("interview-with-the-vampire", [
+      `${root}/video/shows/trafficked-with-mariana-van-zeller`,
+    ]),
+    [],
+  );
+
   // Sharing one token isn't the same show.
   const other = await gateContext(
     `${root}/video/anime/completed/magical-girl-raising-project`,
